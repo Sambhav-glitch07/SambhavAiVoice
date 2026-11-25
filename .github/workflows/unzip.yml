@@ -1,0 +1,36 @@
+name: Auto Extract ZIP
+
+on:
+  push:
+    paths:
+      - '**.zip' # Triggers whenever any .zip file is uploaded/pushed
+
+permissions:
+  contents: write # Grants the workflow permission to commit the extracted files
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unzip and clean up
+        run: |
+          # Find all zip files, extract them to their respective directories, and delete the zip
+          find . -name "*.zip" -exec sh -c '
+            for zip_file do
+              dir=$(dirname "$zip_file")
+              unzip -o "$zip_file" -d "$dir"
+              rm "$zip_file"
+            done
+          ' sh {} +
+
+      - name: Commit extracted files
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .
+          git commit -m "Extract uploaded ZIP archive" || exit 0
+          git push
+          
