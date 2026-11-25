@@ -1,3 +1,4 @@
+
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -5,15 +6,15 @@ import { createClient } from '@supabase/supabase-js';
 import { GoogleGenAI } from '@google/genai';
 
 const {
-GEMINI_API_KEY,
-SUPABASE_URL,
-SUPABASE_ANON_KEY,
-TAVILY_API_KEY
+  GEMINI_API_KEY,
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  TAVILY_API_KEY
 } = process.env;
 
 const MODEL =
-process.env.GEMINI_LIVE_MODEL ||
-'gemini-2.5-flash-native-audio-preview-12-2025';
+  process.env.GEMINI_LIVE_MODEL ||
+  'gemini-2.5-flash-native-audio-preview-12-2025';
 
 const VOICE = process.env.GEMINI_VOICE || 'Aoede';
 const PORT = process.env.PORT || 8787;
@@ -22,9 +23,9 @@ const CACHE_TTL = 20000;
 const MAX_CACHE_ENTRIES = 500;
 
 const dist = path.join(
-path.dirname(fileURLToPath(import.meta.url)),
-'..',
-'dist'
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'dist'
 );
 
 const app = express();
@@ -32,97 +33,91 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '64kb' }));
 
-// Reusable Gemini client
 const gemini = GEMINI_API_KEY
-? new GoogleGenAI({
-apiKey: GEMINI_API_KEY,
-httpOptions: { apiVersion: 'v1alpha' }
-})
-: null;
+  ? new GoogleGenAI({
+      apiKey: GEMINI_API_KEY,
+      httpOptions: { apiVersion: 'v1alpha' }
+    })
+  : null;
 
-// Short-lived user context cache
 const contextCache = new Map();
 const hits = new Map();
 
 function dbFor(jwt) {
-return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-global: {
-headers: {
-Authorization: Bearer ${jwt}
-}
-},
-auth: {
-persistSession: false,
-autoRefreshToken: false,
-detectSessionInUrl: false
-}
-});
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${jwt}`
+      }
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false
+    }
+  });
 }
 
 function clearUserCache(userId) {
-contextCache.delete(userId);
+  contextCache.delete(userId);
 }
 
 function trimCache() {
-if (contextCache.size <= MAX_CACHE_ENTRIES) return;
+  if (contextCache.size <= MAX_CACHE_ENTRIES) return;
 
-const oldest = contextCache.keys().next().value;
-if (oldest) contextCache.delete(oldest);
+  const oldest = contextCache.keys().next().value;
+  if (oldest) contextCache.delete(oldest);
 }
 
-// Authentication and rate limiting
 async function auth(req, res, next) {
-const jwt = (req.headers.authorization || '')
-.replace(/^Bearer\s+/i, '')
-.trim();
+  const jwt = (req.headers.authorization || '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
 
-if (!jwt || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
-return res.status(401).json({
-error: 'Sign in required'
-});
+  if (!jwt || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return res.status(401).json({
+      error: 'Sign in required'
+    });
+  }
+
+  try {
+    const db = dbFor(jwt);
+    const { data, error } = await db.auth.getUser(jwt);
+
+    if (error || !data?.user) {
+      return res.status(401).json({
+        error: 'Invalid session'
+      });
+    }
+
+    const userId = data.user.id;
+    const now = Date.now();
+
+    const recent = (hits.get(userId) || [])
+      .filter(t => now - t < 60000);
+
+    if (recent.length >= 30) {
+      return res.status(429).json({
+        error: 'Slow down'
+      });
+    }
+
+    recent.push(now);
+    hits.set(userId, recent);
+
+    req.user = data.user;
+    req.db = db;
+
+    next();
+  } catch (e) {
+    console.error('Auth error:', e?.message || e);
+
+    return res.status(401).json({
+      error: 'Invalid session'
+    });
+  }
 }
 
-try {
-const db = dbFor(jwt);
-const { data, error } = await db.auth.getUser(jwt);
-
-if (error || !data?.user) {
-return res.status(401).json({
-error: 'Invalid session'
-});
-}
-
-const userId = data.user.id;
-const now = Date.now();
-
-const recent = (hits.get(userId) || [])
-.filter(t => now - t < 60000);
-
-if (recent.length >= 30) {
-return res.status(429).json({
-error: 'Slow down'
-});
-}
-
-recent.push(now);
-hits.set(userId, recent);
-
-req.user = data.user;
-req.db = db;
-
-next();
-
-} catch (e) {
-console.error('Auth error:', e?.message || e);
-
-return res.status(401).json({
-error: 'Invalid session'
-});
-
-}
-}
-
-// Assistant identity and behavior
 const PERSONA = `
 IDENTITY — HIGHEST PRIORITY:
 
@@ -151,8 +146,6 @@ Say: "No, I'm Sambhav AI, built by Sambhav. I use Google's Gemini technology."
 If asked "What is your name?":
 Say: "I'm Sambhav AI."
 
-Do not claim Google created or owns Sambhav AI.
-
 PERSONALITY:
 
 You are a warm, intelligent, sharp and natural personal voice assistant.
@@ -177,380 +170,325 @@ Never claim you searched unless the tool succeeds.
 Be honest, helpful, confident and conversational.
 `;
 
-// Function declarations
 const TOOLS = [
-{
-functionDeclarations: [
-{
-name: 'save_memory',
-description:
-'Save a lasting, non-sensitive personal fact or preference.',
-parameters: {
-type: 'OBJECT',
-properties: {
-content: {
-type: 'STRING',
-description: 'One short self-contained sentence.'
-}
-},
-required: ['content']
-}
-},
-{
-name: 'recall_memory',
-description:
-'Search the user memories for a particular topic.',
-parameters: {
-type: 'OBJECT',
-properties: {
-query: { type: 'STRING' }
-},
-required: ['query']
-}
-},
-...(TAVILY_API_KEY
-? [{
-name: 'web_search',
-description:
-'Search the internet for current or factual information.',
-parameters: {
-type: 'OBJECT',
-properties: {
-query: { type: 'STRING' }
-},
-required: ['query']
-}
-}]
-: [])
-]
-}
+  {
+    functionDeclarations: [
+      {
+        name: 'save_memory',
+        description: 'Save a lasting, non-sensitive personal fact or preference.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            content: {
+              type: 'STRING',
+              description: 'One short self-contained sentence.'
+            }
+          },
+          required: ['content']
+        }
+      },
+      {
+        name: 'recall_memory',
+        description: 'Search the user memories for a particular topic.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            query: { type: 'STRING' }
+          },
+          required: ['query']
+        }
+      },
+      ...(TAVILY_API_KEY
+        ? [{
+            name: 'web_search',
+            description: 'Search the internet for current or factual information.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING' }
+              },
+              required: ['query']
+            }
+          }]
+        : [])
+    ]
+  }
 ];
 
-// Fetch and cache conversation context
 async function getUserContext(userId, db) {
-const cached = contextCache.get(userId);
+  const cached = contextCache.get(userId);
 
-if (cached && Date.now() - cached.time < CACHE_TTL) {
-return cached.value;
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    return cached.value;
+  }
+
+  const [memResult, msgResult] = await Promise.all([
+    db
+      .from('memories')
+      .select('content')
+      .order('created_at', { ascending: false })
+      .limit(30),
+
+    db
+      .from('messages')
+      .select('role,content')
+      .order('created_at', { ascending: false })
+      .limit(12)
+  ]);
+
+  if (memResult.error) {
+    console.error('Memory fetch:', memResult.error.message);
+  }
+
+  if (msgResult.error) {
+    console.error('Message fetch:', msgResult.error.message);
+  }
+
+  const memories = memResult.data || [];
+  const messages = msgResult.data || [];
+
+  const context =
+    `${PERSONA}\nToday is ${new Date().toDateString()}.` +
+    (memories.length
+      ? `\nUser memories:\n- ${memories.map(m => m.content).join('\n- ')}`
+      : '') +
+    (messages.length
+      ? `\nRecent conversation:\n${messages.reverse()
+          .map(m => `${m.role}: ${m.content}`)
+          .join('\n')}`
+      : '');
+
+  contextCache.set(userId, {
+    time: Date.now(),
+    value: context
+  });
+
+  trimCache();
+
+  return context;
 }
 
-const [memResult, msgResult] = await Promise.all([
-db
-.from('memories')
-.select('content')
-.order('created_at', { ascending: false })
-.limit(30),
-
-db
-.from('messages')
-.select('role,content')
-.order('created_at', { ascending: false })
-.limit(12)
-
-]);
-
-if (memResult.error) {
-console.error('Memory fetch:', memResult.error.message);
-}
-
-if (msgResult.error) {
-console.error('Message fetch:', msgResult.error.message);
-}
-
-const memories = memResult.data || [];
-const messages = msgResult.data || [];
-
-const context =
-${PERSONA}\nToday is ${new Date().toDateString()}. +
-
-(memories.length
-? \nUser memories:\n- ${     memories.map(m => m.content).join('\n- ')     }
-: '') +
-
-(messages.length
-? \nRecent conversation:\n${     messages.reverse()     .map(m => ${m.role}: ${m.content})     .join('\n')     }
-: '');
-
-contextCache.set(userId, {
-time: Date.now(),
-value: context
-});
-
-trimCache();
-
-return context;
-}
-
-// Frontend configuration
 app.get('/api/config', (_req, res) => {
-res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store');
 
-res.json({
-supabaseUrl: SUPABASE_URL || '',
-supabaseAnonKey: SUPABASE_ANON_KEY || '',
-search: !!TAVILY_API_KEY
-});
+  res.json({
+    supabaseUrl: SUPABASE_URL || '',
+    supabaseAnonKey: SUPABASE_ANON_KEY || '',
+    search: !!TAVILY_API_KEY
+  });
 });
 
-// Gemini Live temporary token
 app.post('/api/live-token', auth, async (req, res) => {
-res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store');
 
-try {
-if (!gemini) {
-return res.status(500).json({
-error: 'GEMINI_API_KEY not set'
-});
-}
+  try {
+    if (!gemini) {
+      return res.status(500).json({
+        error: 'GEMINI_API_KEY not set'
+      });
+    }
 
-const systemInstruction = await getUserContext(
-req.user.id,
-req.db
-);
+    const systemInstruction = await getUserContext(
+      req.user.id,
+      req.db
+    );
 
-const config = {
-responseModalities: ['AUDIO'],
+    const config = {
+      responseModalities: ['AUDIO'],
+      systemInstruction,
 
-systemInstruction,
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: VOICE
+          }
+        }
+      },
 
-speechConfig: {
-voiceConfig: {
-prebuiltVoiceConfig: {
-voiceName: VOICE
-}
-}
-},
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
 
-inputAudioTranscription: {},
-outputAudioTranscription: {},
+      tools: TOOLS,
 
-tools: TOOLS,
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false
+        }
+      }
+    };
 
-realtimeInputConfig: {
-automaticActivityDetection: {
-disabled: false
-}
-}
-};
+    const token = await gemini.authTokens.create({
+      config: {
+        uses: 1,
 
-const token = await gemini.authTokens.create({
-config: {
-uses: 1,
+        expireTime: new Date(
+          Date.now() + 30 * 60 * 1000
+        ).toISOString(),
 
-expireTime: new Date(    
-  Date.now() + 30 * 60 * 1000    
-).toISOString(),    
+        newSessionExpireTime: new Date(
+          Date.now() + 60 * 1000
+        ).toISOString(),
 
-newSessionExpireTime: new Date(    
-  Date.now() + 60 * 1000    
-).toISOString(),    
+        liveConnectConstraints: {
+          model: MODEL,
+          config
+        },
 
-liveConnectConstraints: {    
-  model: MODEL,    
-  config    
-},    
+        httpOptions: {
+          apiVersion: 'v1alpha'
+        }
+      }
+    });
 
-httpOptions: {    
-  apiVersion: 'v1alpha'    
-}
+    return res.json({
+      token: token.name,
+      model: MODEL,
+      config
+    });
+  } catch (e) {
+    console.error('Token creation error:', e?.message || e);
 
-}
-});
-
-return res.json({
-token: token.name,
-model: MODEL,
-config
-});
-
-} catch (e) {
-console.error(
-'Token creation error:',
-e?.message || e
-);
-
-return res.status(502).json({
-error: 'Could not create Live token'
+    return res.status(502).json({
+      error: 'Could not create Live token'
+    });
+  }
 });
 
-}
-});
-
-// Gemini function execution
 app.post('/api/tool', auth, async (req, res) => {
-const { name, args = {} } = req.body || {};
+  const { name, args = {} } = req.body || {};
 
-try {
-// Save memory
-if (name === 'save_memory') {
-const content = String(args.content || '')
-.trim()
-.slice(0, 500);
+  try {
+    if (name === 'save_memory') {
+      const content = String(args.content || '')
+        .trim()
+        .slice(0, 500);
 
-if (!content) {
-return res.json({
-ok: false,
-error: 'empty'
-});
-}
+      if (!content) {
+        return res.json({ ok: false, error: 'empty' });
+      }
 
-const { error } = await req.db
-.from('memories')
-.insert({ content });
+      const { error } = await req.db
+        .from('memories')
+        .insert({ content });
 
-if (error) {
-console.error('Save memory:', error.message);
+      if (error) {
+        console.error('Save memory:', error.message);
+        return res.json({ ok: false, error: 'memory save failed' });
+      }
 
-return res.json({    
-  ok: false,    
-  error: 'memory save failed'    
-});
+      clearUserCache(req.user.id);
 
-}
+      return res.json({ ok: true });
+    }
 
-clearUserCache(req.user.id);
+    if (name === 'recall_memory') {
+      const query = String(args.query || '')
+        .replace(/[%,()]/g, ' ')
+        .trim()
+        .slice(0, 80);
 
-return res.json({
-ok: true
-});
-}
+      if (!query) {
+        return res.json({ ok: true, memories: [] });
+      }
 
-// Recall memory
-if (name === 'recall_memory') {
-const query = String(args.query || '')
-.replace(/[%,()]/g, ' ')
-.trim()
-.slice(0, 80);
+      const { data, error } = await req.db
+        .from('memories')
+        .select('content,created_at')
+        .ilike('content', `%${query}%`)
+        .order('created_at', { ascending: false })
+        .limit(8);
 
-if (!query) {
-return res.json({
-ok: true,
-memories: []
-});
-}
+      if (error) {
+        console.error('Recall memory:', error.message);
+        return res.json({ ok: false, error: 'memory lookup failed' });
+      }
 
-const { data, error } = await req.db
-.from('memories')
-.select('content,created_at')
-.ilike('content', %${query}%)
-.order('created_at', { ascending: false })
-.limit(8);
+      return res.json({
+        ok: true,
+        memories: data || []
+      });
+    }
 
-if (error) {
-console.error('Recall memory:', error.message);
+    if (name === 'web_search' && TAVILY_API_KEY) {
+      const query = String(args.query || '')
+        .trim()
+        .slice(0, 300);
 
-return res.json({    
-  ok: false,    
-  error: 'memory lookup failed'    
-});
+      if (!query) {
+        return res.json({ ok: false, error: 'empty query' });
+      }
 
-}
+      const response = await fetch(
+        'https://api.tavily.com/search',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${TAVILY_API_KEY}`
+          },
+          body: JSON.stringify({
+            query,
+            max_results: 4,
+            include_answer: true
+          }),
+          signal: AbortSignal.timeout(12000)
+        }
+      );
 
-return res.json({
-ok: true,
-memories: data || []
-});
-}
+      if (!response.ok) {
+        return res.json({
+          ok: false,
+          error: `search ${response.status}`
+        });
+      }
 
-// Web search
-if (name === 'web_search' && TAVILY_API_KEY) {
-const query = String(args.query || '')
-.trim()
-.slice(0, 300);
+      const result = await response.json();
 
-if (!query) {
-return res.json({
-ok: false,
-error: 'empty query'
-});
-}
+      return res.json({
+        ok: true,
+        answer: result.answer || '',
+        results: (result.results || []).map(item => ({
+          title: item.title,
+          url: item.url,
+          content: (item.content || '').slice(0, 400)
+        }))
+      });
+    }
 
-const response = await fetch(
-'https://api.tavily.com/search',
-{
-method: 'POST',
+    return res.status(400).json({
+      ok: false,
+      error: 'unknown tool'
+    });
+  } catch (e) {
+    console.error('Tool execution error:', e?.message || e);
 
-headers: {    
-    'Content-Type': 'application/json',    
-    Authorization: `Bearer ${TAVILY_API_KEY}`    
-  },    
-
-  body: JSON.stringify({    
-    query,    
-    max_results: 4,    
-    include_answer: true    
-  }),    
-
-  signal: AbortSignal.timeout(12000)    
-}
-
-);
-
-if (!response.ok) {
-return res.json({
-ok: false,
-error: search ${response.status}
-});
-}
-
-const result = await response.json();
-
-return res.json({
-ok: true,
-answer: result.answer || '',
-results: (result.results || []).map(item => ({
-title: item.title,
-url: item.url,
-content: (item.content || '').slice(0, 400)
-}))
-});
-}
-
-return res.status(400).json({
-ok: false,
-error: 'unknown tool'
+    return res.status(500).json({
+      ok: false,
+      error: 'tool failed'
+    });
+  }
 });
 
-} catch (e) {
-console.error(
-'Tool execution error:',
-e?.message || e
-);
-
-return res.status(500).json({
-ok: false,
-error: 'tool failed'
-});
-
-}
-});
-
-// Serve frontend
 app.use(express.static(dist));
 
 app.get('*', (_req, res) => {
-res.sendFile(path.join(dist, 'index.html'));
+  res.sendFile(path.join(dist, 'index.html'));
 });
 
-// Clean rate-limit entries
 setInterval(() => {
-const now = Date.now();
+  const now = Date.now();
 
-for (const [id, times] of hits) {
-const active = times.filter(
-t => now - t < 60000
-);
+  for (const [id, times] of hits) {
+    const active = times.filter(t => now - t < 60000);
 
-if (active.length) {
-hits.set(id, active);
-} else {
-hits.delete(id);
-}
-
-}
+    if (active.length) {
+      hits.set(id, active);
+    } else {
+      hits.delete(id);
+    }
+  }
 }, 60000).unref();
 
-// Start server
 app.listen(PORT, () => {
-console.log(Sambhav AI running on port ${PORT});
+  console.log(`Sambhav AI running on port ${PORT}`);
 });
