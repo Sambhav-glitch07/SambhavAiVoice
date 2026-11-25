@@ -86,37 +86,37 @@ try {
 const db = dbFor(jwt);
 const { data, error } = await db.auth.getUser(jwt);
 
-if (error || !data?.user) {  
-  return res.status(401).json({  
-    error: 'Invalid session'  
-  });  
-}  
+if (error || !data?.user) {
+return res.status(401).json({
+error: 'Invalid session'
+});
+}
 
-const userId = data.user.id;  
-const now = Date.now();  
+const userId = data.user.id;
+const now = Date.now();
 
-const recent = (hits.get(userId) || [])  
-  .filter(t => now - t < 60000);  
+const recent = (hits.get(userId) || [])
+.filter(t => now - t < 60000);
 
-if (recent.length >= 30) {  
-  return res.status(429).json({  
-    error: 'Slow down'  
-  });  
-}  
+if (recent.length >= 30) {
+return res.status(429).json({
+error: 'Slow down'
+});
+}
 
-recent.push(now);  
-hits.set(userId, recent);  
+recent.push(now);
+hits.set(userId, recent);
 
-req.user = data.user;  
-req.db = db;  
+req.user = data.user;
+req.db = db;
 
 next();
 
 } catch (e) {
 console.error('Auth error:', e?.message || e);
 
-return res.status(401).json({  
-  error: 'Invalid session'  
+return res.status(401).json({
+error: 'Invalid session'
 });
 
 }
@@ -241,11 +241,11 @@ db
 .order('created_at', { ascending: false })
 .limit(30),
 
-db  
-  .from('messages')  
-  .select('role,content')  
-  .order('created_at', { ascending: false })  
-  .limit(12)
+db
+.from('messages')
+.select('role,content')
+.order('created_at', { ascending: false })
+.limit(12)
 
 ]);
 
@@ -263,19 +263,13 @@ const messages = msgResult.data || [];
 const context =
 ${PERSONA}\nToday is ${new Date().toDateString()}. +
 
-(memories.length  
-  ? `\nUser memories:\n- ${  
-      memories.map(m => m.content).join('\n- ')  
-    }`  
-  : '') +  
+(memories.length
+? \nUser memories:\n- ${     memories.map(m => m.content).join('\n- ')     }
+: '') +
 
-(messages.length  
-  ? `\nRecent conversation:\n${  
-      messages.reverse()  
-        .map(m => `${m.role}: ${m.content}`)  
-        .join('\n')  
-    }`  
-  : '');
+(messages.length
+? \nRecent conversation:\n${     messages.reverse()     .map(m => ${m.role}: ${m.content})     .join('\n')     }
+: '');
 
 contextCache.set(userId, {
 time: Date.now(),
@@ -309,63 +303,64 @@ error: 'GEMINI_API_KEY not set'
 });
 }
 
-const systemInstruction = await getUserContext(  
-  req.user.id,  
-  req.db  
-);  
+const systemInstruction = await getUserContext(
+req.user.id,
+req.db
+);
 
-const config = {  
-  responseModalities: ['AUDIO'],  
+const config = {
+responseModalities: ['AUDIO'],
 
-  systemInstruction,  
+systemInstruction,
 
-  speechConfig: {  
-    voiceConfig: {  
-      prebuiltVoiceConfig: {  
-        voiceName: VOICE  
-      }  
-    }  
-  },  
+speechConfig: {
+voiceConfig: {
+prebuiltVoiceConfig: {
+voiceName: VOICE
+}
+}
+},
 
-  inputAudioTranscription: {},  
-  outputAudioTranscription: {},  
+inputAudioTranscription: {},
+outputAudioTranscription: {},
 
-  tools: TOOLS,  
+tools: TOOLS,
 
-  realtimeInputConfig: {  
-    automaticActivityDetection: {  
-      disabled: false  
-    }  
-  }  
-};  
+realtimeInputConfig: {
+automaticActivityDetection: {
+disabled: false
+}
+}
+};
 
-const token = await gemini.authTokens.create({  
-  config: {  
-    uses: 1,  
+const token = await gemini.authTokens.create({
+config: {
+uses: 1,
 
-    expireTime: new Date(  
-      Date.now() + 30 * 60 * 1000  
-    ).toISOString(),  
+expireTime: new Date(    
+  Date.now() + 30 * 60 * 1000    
+).toISOString(),    
 
-    newSessionExpireTime: new Date(  
-      Date.now() + 60 * 1000  
-    ).toISOString(),  
+newSessionExpireTime: new Date(    
+  Date.now() + 60 * 1000    
+).toISOString(),    
 
-    liveConnectConstraints: {  
-      model: MODEL,  
-      config  
-    },  
+liveConnectConstraints: {    
+  model: MODEL,    
+  config    
+},    
 
-    httpOptions: {  
-      apiVersion: 'v1alpha'  
-    }  
-  }  
-});  
+httpOptions: {    
+  apiVersion: 'v1alpha'    
+}
 
-return res.json({  
-  token: token.name,  
-  model: MODEL,  
-  config  
+}
+});
+
+return res.json({
+token: token.name,
+model: MODEL,
+config
 });
 
 } catch (e) {
@@ -374,8 +369,8 @@ console.error(
 e?.message || e
 );
 
-return res.status(502).json({  
-  error: 'Could not create Live token'  
+return res.status(502).json({
+error: 'Could not create Live token'
 });
 
 }
@@ -392,125 +387,128 @@ const content = String(args.content || '')
 .trim()
 .slice(0, 500);
 
-if (!content) {  
-    return res.json({  
-      ok: false,  
-      error: 'empty'  
-    });  
-  }  
+if (!content) {
+return res.json({
+ok: false,
+error: 'empty'
+});
+}
 
-  const { error } = await req.db  
-    .from('memories')  
-    .insert({ content });  
+const { error } = await req.db
+.from('memories')
+.insert({ content });
 
-  if (error) {  
-    console.error('Save memory:', error.message);  
+if (error) {
+console.error('Save memory:', error.message);
 
-    return res.json({  
-      ok: false,  
-      error: 'memory save failed'  
-    });  
-  }  
+return res.json({    
+  ok: false,    
+  error: 'memory save failed'    
+});
 
-  clearUserCache(req.user.id);  
+}
 
-  return res.json({  
-    ok: true  
-  });  
-}  
+clearUserCache(req.user.id);
 
-// Recall memory  
-if (name === 'recall_memory') {  
-  const query = String(args.query || '')  
-    .replace(/[%,()]/g, ' ')  
-    .trim()  
-    .slice(0, 80);  
+return res.json({
+ok: true
+});
+}
 
-  if (!query) {  
-    return res.json({  
-      ok: true,  
-      memories: []  
-    });  
-  }  
+// Recall memory
+if (name === 'recall_memory') {
+const query = String(args.query || '')
+.replace(/[%,()]/g, ' ')
+.trim()
+.slice(0, 80);
 
-  const { data, error } = await req.db  
-    .from('memories')  
-    .select('content,created_at')  
-    .ilike('content', `%${query}%`)  
-    .order('created_at', { ascending: false })  
-    .limit(8);  
+if (!query) {
+return res.json({
+ok: true,
+memories: []
+});
+}
 
-  if (error) {  
-    console.error('Recall memory:', error.message);  
+const { data, error } = await req.db
+.from('memories')
+.select('content,created_at')
+.ilike('content', %${query}%)
+.order('created_at', { ascending: false })
+.limit(8);
 
-    return res.json({  
-      ok: false,  
-      error: 'memory lookup failed'  
-    });  
-  }  
+if (error) {
+console.error('Recall memory:', error.message);
 
-  return res.json({  
-    ok: true,  
-    memories: data || []  
-  });  
-}  
+return res.json({    
+  ok: false,    
+  error: 'memory lookup failed'    
+});
 
-// Web search  
-if (name === 'web_search' && TAVILY_API_KEY) {  
-  const query = String(args.query || '')  
-    .trim()  
-    .slice(0, 300);  
+}
 
-  if (!query) {  
-    return res.json({  
-      ok: false,  
-      error: 'empty query'  
-    });  
-  }  
+return res.json({
+ok: true,
+memories: data || []
+});
+}
 
-  const response = await fetch(  
-    'https://api.tavily.com/search',  
-    {  
-      method: 'POST',  
+// Web search
+if (name === 'web_search' && TAVILY_API_KEY) {
+const query = String(args.query || '')
+.trim()
+.slice(0, 300);
 
-      headers: {  
-        'Content-Type': 'application/json',  
-        Authorization: `Bearer ${TAVILY_API_KEY}`  
-      },  
+if (!query) {
+return res.json({
+ok: false,
+error: 'empty query'
+});
+}
 
-      body: JSON.stringify({  
-        query,  
-        max_results: 4,  
-        include_answer: true  
-      }),  
+const response = await fetch(
+'https://api.tavily.com/search',
+{
+method: 'POST',
 
-      signal: AbortSignal.timeout(12000)  
-    }  
-  );  
+headers: {    
+    'Content-Type': 'application/json',    
+    Authorization: `Bearer ${TAVILY_API_KEY}`    
+  },    
 
-  if (!response.ok) {  
-    return res.json({  
-      ok: false,  
-      error: `search ${response.status}`  
-    });  
-  }  
+  body: JSON.stringify({    
+    query,    
+    max_results: 4,    
+    include_answer: true    
+  }),    
 
-  const result = await response.json();  
+  signal: AbortSignal.timeout(12000)    
+}
 
-  return res.json({  
-    ok: true,  
-    answer: result.answer || '',  
-    results: (result.results || []).map(item => ({  
-      title: item.title,  
-      url: item.url,  
-      content: (item.content || '').slice(0, 400)  
-    }))  
-  });  
-}  
+);
 
-return res.status(400).json({  
-  ok: false,  
-  error: 'unknown tool'  
+if (!response.ok) {
+return res.json({
+ok: false,
+error: search ${response.status}
+});
+}
+
+const result = await response.json();
+
+return res.json({
+ok: true,
+answer: result.answer || '',
+results: (result.results || []).map(item => ({
+title: item.title,
+url: item.url,
+content: (item.content || '').slice(0, 400)
+}))
+});
+}
+
+return res.status(400).json({
+ok: false,
+error: 'unknown tool'
 });
 
 } catch (e) {
@@ -519,9 +517,9 @@ console.error(
 e?.message || e
 );
 
-return res.status(500).json({  
-  ok: false,  
-  error: 'tool failed'  
+return res.status(500).json({
+ok: false,
+error: 'tool failed'
 });
 
 }
@@ -543,10 +541,10 @@ const active = times.filter(
 t => now - t < 60000
 );
 
-if (active.length) {  
-  hits.set(id, active);  
-} else {  
-  hits.delete(id);  
+if (active.length) {
+hits.set(id, active);
+} else {
+hits.delete(id);
 }
 
 }
