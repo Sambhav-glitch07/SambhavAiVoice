@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0e">
+<title>Sambhav AI</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500&display=swap">
+<style>
+:root{--bg:#0c0d0f;--ink:#e9ebef;--dim:#868b95;--line:rgba(255,255,255,.12);--glass:rgba(255,255,255,.06)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--ink);overflow:hidden;font-family:'Manrope',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+.ui{position:relative;z-index:2;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:calc(22px + env(safe-area-inset-top,0px)) 20px calc(26px + env(safe-area-inset-bottom,0px));pointer-events:none}
+.ui>*{pointer-events:auto}
+header{width:100%;display:flex;justify-content:center;align-items:center;position:relative}
+.mark{font-weight:200;font-size:15px;letter-spacing:.5em;padding-left:.5em;color:var(--ink)}
+.tbtn{position:absolute;right:0;background:none;border:0;color:var(--dim);font:400 13px 'Manrope',sans-serif;cursor:pointer;padding:8px}
+.tbtn[aria-pressed=true]{color:var(--ink)}
+.bottom{display:flex;flex-direction:column;align-items:center;gap:14px;width:100%;max-width:560px}
+#status{font-weight:300;font-size:17px;letter-spacing:.04em;min-height:1.4em;transition:opacity .4s}
+#cap{min-height:3.6em;text-align:center;font-weight:300;font-size:15px;line-height:1.55;color:var(--dim);max-width:34em;transition:opacity .4s}
+#cap b{font-weight:400;color:var(--ink)}
+.off #cap{opacity:0}
+.row{display:flex;align-items:center;gap:26px;margin-top:2px}
+button.c{border:1px solid var(--line);background:var(--glass);color:var(--ink);cursor:pointer;border-radius:50%;display:grid;place-items:center;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);transition:transform .25s,background .25s,border-color .25s}
+button.c:active{transform:scale(.94)}
+button.c:focus-visible,.tbtn:focus-visible{outline:2px solid #bcd0ff;outline-offset:3px}
+button.s{width:46px;height:46px}
+button.m{width:76px;height:76px;background:linear-gradient(160deg,rgba(255,255,255,.16),rgba(255,255,255,.04));box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 10px 40px rgba(120,150,255,.12)}
+button.m.on{border-color:rgba(200,220,255,.55);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 0 0 6px rgba(160,190,255,.08),0 10px 50px rgba(130,160,255,.3)}
+button.s.on{background:rgba(255,255,255,.88);color:#111}
+svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+button.m svg{width:28px;height:28px}
+#err{position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:30px;color:var(--dim);z-index:5}
+@media (max-width:520px){.mark{font-size:13px}.row{gap:22px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+#auth{position:fixed;inset:0;z-index:6;display:none;place-items:center;background:rgba(12,13,15,.84);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+#auth.show{display:grid}#auth form{width:min(340px,86vw);display:flex;flex-direction:column;gap:12px;text-align:center}
+#auth input{background:var(--glass);border:1px solid var(--line);border-radius:14px;padding:14px 16px;color:var(--ink);font:300 15px 'Manrope',system-ui,sans-serif}
+#auth input:focus-visible{outline:2px solid #bcd0ff;outline-offset:2px}
+#auth .go{border:1px solid rgba(200,220,255,.4);background:linear-gradient(160deg,rgba(255,255,255,.16),rgba(255,255,255,.04));color:var(--ink);border-radius:14px;padding:14px;font:400 15px 'Manrope',sans-serif;cursor:pointer}
+#auth .alt{background:none;border:0;color:var(--dim);font:300 14px 'Manrope',sans-serif;cursor:pointer;padding:6px}
+#am{min-height:1.3em;color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+<canvas id="gl" aria-hidden="true"></canvas>
+<div id="err">This device couldn’t start WebGL, which the Sambhav globe needs.</div>
+<div id="auth"><form id="af"><div class="mark" style="margin-bottom:10px">SAMBHAV AI</div>
+<input id="em" type="email" placeholder="Email" autocomplete="email" required aria-label="Email">
+<input id="pw" type="password" placeholder="Password" autocomplete="current-password" minlength="6" required aria-label="Password">
+<button class="go" type="submit">Sign in</button><button class="alt" id="su" type="button">Create account</button><div id="am" aria-live="polite"></div></form></div>
+<div class="ui" id="ui">
+<header><button class="tbtn" id="so" style="left:0;right:auto" hidden>Sign out</button><div class="mark">SAMBHAV AI</div><button class="tbtn" id="tb" aria-pressed="true">Transcript</button></header>
+<div class="bottom"><div id="status" aria-live="polite">Tap to talk</div><div id="cap" aria-live="polite"></div><div class="row">
+<button class="c s" id="mute" aria-label="Mute" title="Mute"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M16 9.5a4 4 0 0 1 0 5M19 7a8 8 0 0 1 0 10"/></svg></button>
+<button class="c m" id="mic" aria-label="Talk to Sambhav"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+<button class="c s" id="end" aria-label="End call" title="End call"><svg viewBox="0 0 24 24"><path d="M5 15c4-3.5 10-3.5 14 0l-1.8 2.4-3-1.2v-2.4a9 9 0 0 0-4.4 0v2.4l-3 1.2z"/></svg></button>
+</div></div></div>
+<script type="module" src="/src/main.js"></script>
+</body></html>
