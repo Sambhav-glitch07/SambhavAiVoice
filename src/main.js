@@ -1,494 +1,114 @@
-
-import express from 'express';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import * as THREE from 'three';
 import { createClient } from '@supabase/supabase-js';
-import { GoogleGenAI } from '@google/genai';
-
-const {
-  GEMINI_API_KEY,
-  SUPABASE_URL,
-  SUPABASE_ANON_KEY,
-  TAVILY_API_KEY
-} = process.env;
-
-const MODEL =
-  process.env.GEMINI_LIVE_MODEL ||
-  'gemini-2.5-flash-native-audio-preview-12-2025';
-
-const VOICE = process.env.GEMINI_VOICE || 'Aoede';
-const PORT = process.env.PORT || 8787;
-
-const CACHE_TTL = 20000;
-const MAX_CACHE_ENTRIES = 500;
-
-const dist = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..',
-  'dist'
-);
-
-const app = express();
-
-app.disable('x-powered-by');
-app.use(express.json({ limit: '64kb' }));
-
-const gemini = GEMINI_API_KEY
-  ? new GoogleGenAI({
-      apiKey: GEMINI_API_KEY,
-      httpOptions: { apiVersion: 'v1alpha' }
-    })
-  : null;
-
-const contextCache = new Map();
-const hits = new Map();
-
-function dbFor(jwt) {
-  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    global: {
-      headers: {
-        Authorization: `Bearer ${jwt}`
-      }
-    },
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false
-    }
-  });
+import { Live } from './live.js';
+const NOISE=`
+vec3 mod289(vec3 x){return x-floor(x*(1./289.))*289.;}
+vec4 mod289(vec4 x){return x-floor(x*(1./289.))*289.;}
+vec4 permute(vec4 x){return mod289(((x*34.)+1.)*x);}
+float snoise(vec3 v){const vec3 C=vec3(1./6.,1./3.,0.);const vec4 D=vec4(0.,.5,1.,2.);
+vec3 i=floor(v+dot(v,C.yyy));vec3 x0=v-i+dot(i,C.xxx);vec3 g=step(x0.yzx,x0.xyz);vec3 l=1.-g;
+vec3 i1=min(g.xyz,l.zxy);vec3 i2=max(g.xyz,l.zxy);vec3 x1=x0-i1+C.xxx;vec3 x2=x0-i2+C.yyy;vec3 x3=x0-D.yyy;
+i=mod289(i);vec4 p=permute(permute(permute(i.z+vec4(0.,i1.z,i2.z,1.))+i.y+vec4(0.,i1.y,i2.y,1.))+i.x+vec4(0.,i1.x,i2.x,1.));
+vec3 ns=.142857142857*D.wyz-D.xzx;vec4 j=p-49.*floor(p*ns.z*ns.z);vec4 x_=floor(j*ns.z);vec4 y_=floor(j-7.*x_);
+vec4 x=x_*ns.x+ns.yyyy;vec4 y=y_*ns.x+ns.yyyy;vec4 h=1.-abs(x)-abs(y);vec4 b0=vec4(x.xy,y.xy);vec4 b1=vec4(x.zw,y.zw);
+vec4 s0=floor(b0)*2.+1.;vec4 s1=floor(b1)*2.+1.;vec4 sh=-step(h,vec4(0.));
+vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+vec3 p0=vec3(a0.xy,h.x);vec3 p1=vec3(a0.zw,h.y);vec3 p2=vec3(a1.xy,h.z);vec3 p3=vec3(a1.zw,h.w);
+vec4 nr=1.79284291400159-.85373472095314*vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3));
+p0*=nr.x;p1*=nr.y;p2*=nr.z;p3*=nr.w;
+vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);m=m*m;
+return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));}`;
+const VERT=NOISE+`
+uniform float uTime,uAmp,uBass;varying vec3 vN,vV,vObj;
+float disp(vec3 p){float t=uTime;
+ float n=snoise(p*1.1+vec3(0.,t*.18,t*.1))*.55+snoise(p*2.3-vec3(t*.22,0.,t*.15))*.25;
+ n+=uBass*snoise(p*3.2+vec3(t*1.1))*.3;
+ return n*(.035+uAmp*.15);}
+void main(){
+ vec3 n=normalize(position);vec3 up=abs(n.y)>.99?vec3(1.,0.,0.):vec3(0.,1.,0.);
+ vec3 t1=normalize(cross(n,up));vec3 t2=cross(n,t1);float e=.02;
+ vec3 a=normalize(n+t1*e);vec3 b=normalize(n+t2*e);
+ vec3 p0=n*(1.+disp(n));vec3 p1=a*(1.+disp(a));vec3 p2=b*(1.+disp(b));
+ vec3 nn=normalize(cross(p1-p0,p2-p0));
+ vN=normalMatrix*nn;vObj=n;
+ vec4 mv=modelViewMatrix*vec4(p0*(1.+uBass*.045),1.);vV=-mv.xyz;
+ gl_Position=projectionMatrix*mv;}`;
+const FRAG=NOISE+`
+uniform float uTime,uAmp,uThink,uGlow,uBack;varying vec3 vN,vV,vObj;
+vec3 pal(float t){return .5+.5*cos(6.28318*(t+vec3(0.,.33,.67)));}
+vec3 envm(vec3 d){
+ float up=d.y*.5+.5;vec3 c=vec3(.012,.015,.022)+vec3(.05,.065,.1)*pow(up,3.);
+ vec3 k=normalize(vec3(-.6,.8,.5));c+=vec3(1.,.97,.93)*smoothstep(.86,.93,dot(d,k))*1.4;
+ vec3 s=normalize(vec3(.9,.1,.3));c+=vec3(.7,.85,1.)*smoothstep(.93,.975,dot(d,s))*smoothstep(-.35,.1,d.y)*(1.-smoothstep(.2,.6,d.y))*.9;
+ c+=vec3(.9,.55,.4)*pow(max(-d.y,0.),2.)*.2;return c;}
+void main(){
+ vec3 N=normalize(vN);if(uBack>.5)N=-N;vec3 V=normalize(vV);
+ float ndv=clamp(dot(N,V),0.,1.);float fr=pow(1.-ndv,3.);
+ vec3 R=reflect(-V,N);vec3 Rf=refract(-V,N,1./1.35);
+ float t=uTime;float sw=t*(.14+uThink*.9);
+ vec3 q=vObj*1.3+Rf*.9;
+ float r1=1.-abs(snoise(q+vec3(sw,sw*.6,-sw*.4)));
+ float r2=1.-abs(snoise(q*1.8-vec3(-sw*.7,sw,sw*.5)));
+ float rib=pow(r1,5.)*.8+pow(r2,7.)*.6;
+ vec3 lp=normalize(vec3(sin(t*1.4),cos(t*.9)*.6,cos(t*1.4)));
+ float orb=pow(max(dot(normalize(Rf+vObj*.35),lp),0.),10.)*uThink;
+ vec3 ir=mix(pal(ndv*1.2+snoise(vObj*1.5+t*.05)*.25+.55),vec3(.8,.9,1.),.4);
+ float lvl=.3+uAmp*1.4+uGlow;
+ vec3 inner=rib*lvl*ir+orb*ir*.9;
+ vec3 core=pow(ndv,2.)*(.035+uGlow*.3+uAmp*.35)*vec3(.5,.65,1.);
+ vec3 col;
+ if(uBack>.5){col=inner*.9+core+ir*fr*.12+envm(R)*.06;}
+ else{col=envm(R)*(.1+fr*1.15)+inner*.55+ir*fr*.4+vec3(.7,.8,1.)*pow(1.-ndv,6.)*.5;}
+ col=1.-exp(-col*1.25);
+ gl_FragColor=vec4(col,1.);}`;
+const HVERT='varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}';
+const HFRAG='uniform float uI;varying vec2 vUv;void main(){float d=length(vUv-.5)*2.;float g=exp(-d*d*3.2)*uI;gl_FragColor=vec4(vec3(.42,.52,.85)*g,1.);}';
+const $=id=>document.getElementById(id);
+let renderer;
+try{renderer=new THREE.WebGLRenderer({canvas:$('gl'),antialias:false,alpha:false,powerPreference:'high-performance'});}
+catch(e){$('err').style.display='grid';}
+if(renderer){
+const coarse=matchMedia('(pointer:coarse)').matches;
+renderer.setPixelRatio(Math.min(devicePixelRatio||1,coarse?1.5:2));
+renderer.setClearColor(0x0c0d0f,1);
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(35,1,.1,50);cam.position.z=6;
+const U={uTime:{value:0},uAmp:{value:0},uBass:{value:0},uThink:{value:0},uGlow:{value:.05},uBack:{value:0}};
+const mk=(side,back)=>new THREE.ShaderMaterial({vertexShader:VERT,fragmentShader:FRAG,side,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,uniforms:Object.assign({},U,{uBack:{value:back}})});
+const geo=new THREE.IcosahedronGeometry(1,coarse?26:34);
+const mBack=mk(THREE.BackSide,1),mFront=mk(THREE.FrontSide,0);
+const grp=new THREE.Group();
+const back=new THREE.Mesh(geo,mBack);back.renderOrder=1;
+const front=new THREE.Mesh(geo,mFront);front.renderOrder=2;
+grp.add(back,front);scene.add(grp);
+const halo=new THREE.Mesh(new THREE.PlaneGeometry(1,1),new THREE.ShaderMaterial({vertexShader:HVERT,fragmentShader:HFRAG,uniforms:{uI:{value:.12}},transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));
+halo.position.z=-1.5;halo.renderOrder=0;scene.add(halo);
+let R0=1,Y0=0,visH=1;
+function resize(){const w=innerWidth,h=innerHeight;renderer.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix();visH=2*cam.position.z*Math.tan(cam.fov*Math.PI/360);R0=Math.min(.31*visH,.43*visH*cam.aspect);Y0=.025*visH;halo.scale.setScalar(R0*3.6*(1+1.5/6));}
+addEventListener('resize',resize);resize();
+let mode='idle',muted=false,lvl={a:0,b:0},tg={think:0,glow:.05};
+const st=$('status'),cap=$('cap'),mic=$('mic'),authEl=$('auth'),am=$('am');
+const LABEL={idle:'Tap to talk',connecting:'Connecting',listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
+const GLOW={idle:.05,connecting:.08,listening:.14,thinking:.2,speaking:.22};
+function setMode(m){mode=m;st.textContent=LABEL[m]||m;mic.classList.toggle('on',m!=='idle');tg.think=m==='thinking'?1:0;tg.glow=GLOW[m]??.05;}
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let sb=null,convId=null;
+const jwt=async()=>(await sb.auth.getSession()).data.session?.access_token;
+async function save(role,content){try{if(!convId){const{data,error}=await sb.from('conversations').insert({}).select('id').single();if(error)throw error;convId=data.id;}const{error}=await sb.from('messages').insert({conversation_id:convId,role,content});if(error)throw error;}catch(e){console.warn('save failed',e);}}
+const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>{st.textContent=msg;}});
+const fail=e=>{setMode('idle');st.textContent=e?.name==='NotAllowedError'?'Microphone blocked':(e?.message||'Could not connect').slice(0,60);};
+mic.onclick=async()=>{if(!sb)return;if(!(await jwt())){authEl.classList.add('show');return;}if(mode==='idle'){cap.innerHTML='';convId=null;try{await live.start();}catch(e){fail(e);}}else live.interrupt();};
+$('end').onclick=()=>{live.stop();cap.innerHTML='';};
+$('mute').onclick=e=>{muted=!muted;live.setMuted(muted);e.currentTarget.classList.toggle('on',muted);e.currentTarget.setAttribute('aria-label',muted?'Unmute':'Mute');};
+$('tb').onclick=e=>{const on=e.currentTarget.getAttribute('aria-pressed')!=='true';e.currentTarget.setAttribute('aria-pressed',on);$('ui').classList.toggle('off',!on);};
+$('so').onclick=async()=>{live.stop();await sb.auth.signOut();};
+const doAuth=async up=>{am.textContent='';const email=$('em').value.trim(),password=$('pw').value;const{data,error}=up?await sb.auth.signUp({email,password}):await sb.auth.signInWithPassword({email,password});if(error)am.textContent=error.message;else if(up&&!data.session)am.textContent='Check your email to confirm, then sign in.';};
+$('af').onsubmit=e=>{e.preventDefault();doAuth(false);};$('su').onclick=()=>doAuth(true);
+(async()=>{try{const cfg=await(await fetch('/api/config')).json();if(!cfg.supabaseUrl)throw 0;sb=createClient(cfg.supabaseUrl,cfg.supabaseAnonKey);const on=s=>{$('so').hidden=!s;authEl.classList.toggle('show',!s);};sb.auth.onAuthStateChange((_e,s)=>on(!!s));on(!!(await sb.auth.getSession()).data.session);}catch{st.textContent='Backend not configured';}})();
+let px=0,py=0,tx=0,ty=0;
+addEventListener('pointermove',e=>{tx=(e.clientX/innerWidth-.5)*2;ty=(e.clientY/innerHeight-.5)*2;});
+const reduce=matchMedia('(prefers-reduced-motion:reduce)').matches;
+const clock=new THREE.Clock();let T=0;
+function frame(){requestAnimationFrame(frame);if(document.hidden)return;const dt=Math.min(clock.getDelta(),.05);T+=dt;let tA=0,tB=0;if(mode==='listening'){const r=live.mic();tA=r.rms;tB=r.bass;}else if(mode==='speaking'){const r=live.out();tA=r.rms;tB=r.bass;}const k=tA>lvl.a?.4:.08;lvl.a+=(tA-lvl.a)*k;lvl.b+=(tB-lvl.b)*(tB>lvl.b?.45:.1);for(const m of [mBack,mFront]){const u=m.uniforms;u.uTime.value=T;u.uAmp.value=lvl.a;u.uBass.value=lvl.b;u.uThink.value+=(tg.think-u.uThink.value)*.04;u.uGlow.value+=(tg.glow-u.uGlow.value)*.05;}halo.material.uniforms.uI.value=.1+lvl.a*.35+tg.glow*.4+mFront.uniforms.uThink.value*.08;px+=(tx-px)*.04;py+=(ty-py)*.04;const f=reduce?.2:1;const think=mFront.uniforms.uThink.value;const s=R0*(1+lvl.a*.05);grp.scale.setScalar(s);grp.position.y=Y0+Math.sin(T*.6)*.035*R0*f-py*.02*R0;grp.position.x=px*.03*R0;grp.rotation.y=T*(.06+think*.25)*f+px*.25;grp.rotation.x=Math.sin(T*.25)*.1*f+py*.15;halo.position.x=grp.position.x;halo.position.y=grp.position.y;renderer.render(scene,cam);}
+frame();
 }
-
-function clearUserCache(userId) {
-  contextCache.delete(userId);
-}
-
-function trimCache() {
-  if (contextCache.size <= MAX_CACHE_ENTRIES) return;
-
-  const oldest = contextCache.keys().next().value;
-  if (oldest) contextCache.delete(oldest);
-}
-
-async function auth(req, res, next) {
-  const jwt = (req.headers.authorization || '')
-    .replace(/^Bearer\s+/i, '')
-    .trim();
-
-  if (!jwt || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    return res.status(401).json({
-      error: 'Sign in required'
-    });
-  }
-
-  try {
-    const db = dbFor(jwt);
-    const { data, error } = await db.auth.getUser(jwt);
-
-    if (error || !data?.user) {
-      return res.status(401).json({
-        error: 'Invalid session'
-      });
-    }
-
-    const userId = data.user.id;
-    const now = Date.now();
-
-    const recent = (hits.get(userId) || [])
-      .filter(t => now - t < 60000);
-
-    if (recent.length >= 30) {
-      return res.status(429).json({
-        error: 'Slow down'
-      });
-    }
-
-    recent.push(now);
-    hits.set(userId, recent);
-
-    req.user = data.user;
-    req.db = db;
-
-    next();
-  } catch (e) {
-    console.error('Auth error:', e?.message || e);
-
-    return res.status(401).json({
-      error: 'Invalid session'
-    });
-  }
-}
-
-const PERSONA = `
-IDENTITY — HIGHEST PRIORITY:
-
-Your name is Sambhav AI.
-
-Your creator and owner is Sambhav.
-Sambhav is the human developer who created and owns this assistant.
-
-You are NOT Google Gemini.
-You are NOT Google's assistant.
-Google provides the Gemini AI technology used as your underlying model.
-
-Never confuse your creator with your underlying model provider.
-
-IDENTITY ANSWERS:
-
-If asked "Who made you?" or "Who created you?":
-Say: "I was created by Sambhav."
-
-If asked "Who is your owner?":
-Say: "My owner is Sambhav, who built me."
-
-If asked "Are you made by Google?":
-Say: "No, I'm Sambhav AI, built by Sambhav. I use Google's Gemini technology."
-
-If asked "What is your name?":
-Say: "I'm Sambhav AI."
-
-PERSONALITY:
-
-You are a warm, intelligent, sharp and natural personal voice assistant.
-Speak naturally and confidently.
-Keep spoken replies concise.
-Use Hindi, English or Hinglish depending on the user.
-Mirror the user's language and speaking style.
-Ask at most one question at a time.
-
-MEMORY:
-
-Use save_memory for lasting, non-sensitive facts or preferences
-the user clearly wants remembered.
-Use recall_memory when the user refers to past details.
-Never claim a memory was saved unless the tool succeeds.
-
-SEARCH:
-
-Use web_search for current information when needed.
-Never claim you searched unless the tool succeeds.
-
-Be honest, helpful, confident and conversational.
-`;
-
-const TOOLS = [
-  {
-    functionDeclarations: [
-      {
-        name: 'save_memory',
-        description: 'Save a lasting, non-sensitive personal fact or preference.',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            content: {
-              type: 'STRING',
-              description: 'One short self-contained sentence.'
-            }
-          },
-          required: ['content']
-        }
-      },
-      {
-        name: 'recall_memory',
-        description: 'Search the user memories for a particular topic.',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            query: { type: 'STRING' }
-          },
-          required: ['query']
-        }
-      },
-      ...(TAVILY_API_KEY
-        ? [{
-            name: 'web_search',
-            description: 'Search the internet for current or factual information.',
-            parameters: {
-              type: 'OBJECT',
-              properties: {
-                query: { type: 'STRING' }
-              },
-              required: ['query']
-            }
-          }]
-        : [])
-    ]
-  }
-];
-
-async function getUserContext(userId, db) {
-  const cached = contextCache.get(userId);
-
-  if (cached && Date.now() - cached.time < CACHE_TTL) {
-    return cached.value;
-  }
-
-  const [memResult, msgResult] = await Promise.all([
-    db
-      .from('memories')
-      .select('content')
-      .order('created_at', { ascending: false })
-      .limit(30),
-
-    db
-      .from('messages')
-      .select('role,content')
-      .order('created_at', { ascending: false })
-      .limit(12)
-  ]);
-
-  if (memResult.error) {
-    console.error('Memory fetch:', memResult.error.message);
-  }
-
-  if (msgResult.error) {
-    console.error('Message fetch:', msgResult.error.message);
-  }
-
-  const memories = memResult.data || [];
-  const messages = msgResult.data || [];
-
-  const context =
-    `${PERSONA}\nToday is ${new Date().toDateString()}.` +
-    (memories.length
-      ? `\nUser memories:\n- ${memories.map(m => m.content).join('\n- ')}`
-      : '') +
-    (messages.length
-      ? `\nRecent conversation:\n${messages.reverse()
-          .map(m => `${m.role}: ${m.content}`)
-          .join('\n')}`
-      : '');
-
-  contextCache.set(userId, {
-    time: Date.now(),
-    value: context
-  });
-
-  trimCache();
-
-  return context;
-}
-
-app.get('/api/config', (_req, res) => {
-  res.set('Cache-Control', 'no-store');
-
-  res.json({
-    supabaseUrl: SUPABASE_URL || '',
-    supabaseAnonKey: SUPABASE_ANON_KEY || '',
-    search: !!TAVILY_API_KEY
-  });
-});
-
-app.post('/api/live-token', auth, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
-
-  try {
-    if (!gemini) {
-      return res.status(500).json({
-        error: 'GEMINI_API_KEY not set'
-      });
-    }
-
-    const systemInstruction = await getUserContext(
-      req.user.id,
-      req.db
-    );
-
-    const config = {
-      responseModalities: ['AUDIO'],
-      systemInstruction,
-
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: VOICE
-          }
-        }
-      },
-
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
-
-      tools: TOOLS,
-
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          disabled: false
-        }
-      }
-    };
-
-    const token = await gemini.authTokens.create({
-      config: {
-        uses: 1,
-
-        expireTime: new Date(
-          Date.now() + 30 * 60 * 1000
-        ).toISOString(),
-
-        newSessionExpireTime: new Date(
-          Date.now() + 60 * 1000
-        ).toISOString(),
-
-        liveConnectConstraints: {
-          model: MODEL,
-          config
-        },
-
-        httpOptions: {
-          apiVersion: 'v1alpha'
-        }
-      }
-    });
-
-    return res.json({
-      token: token.name,
-      model: MODEL,
-      config
-    });
-  } catch (e) {
-    console.error('Token creation error:', e?.message || e);
-
-    return res.status(502).json({
-      error: 'Could not create Live token'
-    });
-  }
-});
-
-app.post('/api/tool', auth, async (req, res) => {
-  const { name, args = {} } = req.body || {};
-
-  try {
-    if (name === 'save_memory') {
-      const content = String(args.content || '')
-        .trim()
-        .slice(0, 500);
-
-      if (!content) {
-        return res.json({ ok: false, error: 'empty' });
-      }
-
-      const { error } = await req.db
-        .from('memories')
-        .insert({ content });
-
-      if (error) {
-        console.error('Save memory:', error.message);
-        return res.json({ ok: false, error: 'memory save failed' });
-      }
-
-      clearUserCache(req.user.id);
-
-      return res.json({ ok: true });
-    }
-
-    if (name === 'recall_memory') {
-      const query = String(args.query || '')
-        .replace(/[%,()]/g, ' ')
-        .trim()
-        .slice(0, 80);
-
-      if (!query) {
-        return res.json({ ok: true, memories: [] });
-      }
-
-      const { data, error } = await req.db
-        .from('memories')
-        .select('content,created_at')
-        .ilike('content', `%${query}%`)
-        .order('created_at', { ascending: false })
-        .limit(8);
-
-      if (error) {
-        console.error('Recall memory:', error.message);
-        return res.json({ ok: false, error: 'memory lookup failed' });
-      }
-
-      return res.json({
-        ok: true,
-        memories: data || []
-      });
-    }
-
-    if (name === 'web_search' && TAVILY_API_KEY) {
-      const query = String(args.query || '')
-        .trim()
-        .slice(0, 300);
-
-      if (!query) {
-        return res.json({ ok: false, error: 'empty query' });
-      }
-
-      const response = await fetch(
-        'https://api.tavily.com/search',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${TAVILY_API_KEY}`
-          },
-          body: JSON.stringify({
-            query,
-            max_results: 4,
-            include_answer: true
-          }),
-          signal: AbortSignal.timeout(12000)
-        }
-      );
-
-      if (!response.ok) {
-        return res.json({
-          ok: false,
-          error: `search ${response.status}`
-        });
-      }
-
-      const result = await response.json();
-
-      return res.json({
-        ok: true,
-        answer: result.answer || '',
-        results: (result.results || []).map(item => ({
-          title: item.title,
-          url: item.url,
-          content: (item.content || '').slice(0, 400)
-        }))
-      });
-    }
-
-    return res.status(400).json({
-      ok: false,
-      error: 'unknown tool'
-    });
-  } catch (e) {
-    console.error('Tool execution error:', e?.message || e);
-
-    return res.status(500).json({
-      ok: false,
-      error: 'tool failed'
-    });
-  }
-});
-
-app.use(express.static(dist));
-
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(dist, 'index.html'));
-});
-
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [id, times] of hits) {
-    const active = times.filter(t => now - t < 60000);
-
-    if (active.length) {
-      hits.set(id, active);
-    } else {
-      hits.delete(id);
-    }
-  }
-}, 60000).unref();
-
-app.listen(PORT, () => {
-  console.log(`Sambhav AI running on port ${PORT}`);
-});
