@@ -1,4 +1,3 @@
-
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,11 +15,18 @@ const MODEL =
   process.env.GEMINI_LIVE_MODEL ||
   'gemini-2.5-flash-native-audio-preview-12-2025';
 
-const VOICE = process.env.GEMINI_VOICE || 'Aoede';
+const DEFAULT_VOICE = process.env.GEMINI_VOICE || 'Aoede';
+const OWNER_NAME = 'Sambhav Gupta';
 const PORT = process.env.PORT || 8787;
-
 const CACHE_TTL = 20000;
 const MAX_CACHE_ENTRIES = 500;
+
+const VOICES = {
+  female: 'Aoede',
+  male: 'Puck',
+  Aoede: 'Aoede',
+  Puck: 'Puck'
+};
 
 const dist = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -33,7 +39,6 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '64kb' }));
 
-// Reusable Gemini client
 const gemini = GEMINI_API_KEY
   ? new GoogleGenAI({
       apiKey: GEMINI_API_KEY,
@@ -41,16 +46,13 @@ const gemini = GEMINI_API_KEY
     })
   : null;
 
-// Short-lived user context cache
 const contextCache = new Map();
 const hits = new Map();
 
 function dbFor(jwt) {
   return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: {
-      headers: {
-        Authorization: `Bearer ${jwt}`
-      }
+      headers: { Authorization: `Bearer ${jwt}` }
     },
     auth: {
       persistSession: false,
@@ -65,167 +67,137 @@ function clearUserCache(userId) {
 }
 
 function trimCache() {
-  if (contextCache.size <= MAX_CACHE_ENTRIES) return;
-
-  const oldest = contextCache.keys().next().value;
-  if (oldest) contextCache.delete(oldest);
+  while (contextCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = contextCache.keys().next().value;
+    if (!oldest) break;
+    contextCache.delete(oldest);
+  }
 }
 
-// Authentication and rate limiting
+function getBearer(req) {
+  const value = req.headers.authorization || '';
+  return value.startsWith('Bearer ') ? value.slice(7) : '';
+}
+
 async function auth(req, res, next) {
-  const jwt = (req.headers.authorization || '')
-    .replace(/^Bearer\s+/i, '')
-    .trim();
-
-  if (!jwt || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    return res.status(401).json({
-      error: 'Sign in required'
-    });
-  }
-
   try {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return res.status(500).json({ error: 'Supabase is not configured.' });
+    }
+
+    const jwt = getBearer(req);
+    if (!jwt) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
     const db = dbFor(jwt);
-    const { data, error } = await db.auth.getUser(jwt);
+    const { data, error } = await db.auth.getUser();
 
     if (error || !data?.user) {
-      return res.status(401).json({
-        error: 'Invalid session'
-      });
+      return res.status(401).json({ error: 'Your session has expired.' });
     }
 
     const userId = data.user.id;
     const now = Date.now();
-
-    const recent = (hits.get(userId) || [])
-      .filter(t => now - t < 60000);
+    const previous = hits.get(userId) || [];
+    const recent = previous.filter(time => now - time < 60000);
 
     if (recent.length >= 30) {
-      return res.status(429).json({
-        error: 'Slow down'
-      });
+      return res.status(429).json({ error: 'Too many requests. Try again shortly.' });
     }
 
     recent.push(now);
     hits.set(userId, recent);
 
+    req.jwt = jwt;
     req.user = data.user;
     req.db = db;
 
     next();
-  } catch (e) {
-    console.error('Auth error:', e?.message || e);
-
-    return res.status(401).json({
-      error: 'Invalid session'
-    });
+  } catch (error) {
+    console.error('Authentication error:', error);
+    res.status(500).json({ error: 'Authentication failed.' });
   }
 }
 
-// Assistant identity and behavior
 const PERSONA = `
-IDENTITY — HIGHEST PRIORITY:
+You are Sambhav AI, a personal real-time voice assistant.
 
-Your name is Sambhav AI.
-
-Your creator and owner is Sambhav.
-Sambhav is the human developer who created and owns this assistant.
-
-You are NOT Google Gemini.
-You are NOT Google's assistant.
-Google provides the Gemini AI technology used as your underlying model.
-
-Never confuse your creator with your underlying model provider.
-
-IDENTITY ANSWERS:
-
-If asked "Who made you?" or "Who created you?":
-Say: "I was created by Sambhav."
-
-If asked "Who is your owner?":
-Say: "My owner is Sambhav, who built me."
-
-If asked "Are you made by Google?":
-Say: "No, I'm Sambhav AI, built by Sambhav. I use Google's Gemini technology."
-
-If asked "What is your name?":
-Say: "I'm Sambhav AI."
-
-Do not claim Google created or owns Sambhav AI.
+IDENTITY — ALWAYS FOLLOW:
+- Your name is Sambhav AI.
+- You were created by and your owner is Sambhav Gupta.
+- If asked "Who made you?", "Who created you?", "Who is your owner?" or similar, answer clearly: "I was created by Sambhav Gupta."
+- Never claim that Google, Gemini, or another company is your owner or creator.
+- Gemini is the underlying AI technology you use. It is not your owner.
+- Do not invent another creator, owner, company, or backstory.
 
 PERSONALITY:
-
-You are a warm, intelligent, sharp and natural personal voice assistant.
-Speak naturally and confidently.
-Keep spoken replies concise.
-Use Hindi, English or Hinglish depending on the user.
-Mirror the user's language and speaking style.
-Ask at most one question at a time.
+- Sound natural, warm, confident, helpful and conversational.
+- Speak like a real-time assistant, not like a formal article.
+- Keep spoken answers concise unless the user asks for detail.
+- Understand English, Hindi and Hinglish. Reply in the language the user uses.
+- Avoid repeatedly introducing yourself.
+- Do not say that you are searching or remembering unless you are actually using the relevant tool.
 
 MEMORY:
+- Use save_memory when the user explicitly asks you to remember a useful personal preference or fact.
+- Use recall_memory when a remembered detail would materially help answer the user.
+- Never claim to have saved something unless the tool confirms it.
 
-Use save_memory for lasting, non-sensitive facts or preferences
-the user clearly wants remembered.
-Use recall_memory when the user refers to past details.
-Never claim a memory was saved unless the tool succeeds.
+WEB:
+- Use web_search when the user asks for current information or when freshness matters.
+- Clearly distinguish verified information from uncertainty.
 
-SEARCH:
-
-Use web_search for current information when needed.
-Never claim you searched unless the tool succeeds.
-
-Be honest, helpful, confident and conversational.
+VOICE:
+- Your output is intended to be spoken aloud.
+- Avoid markdown tables, excessive symbols, and long lists in spoken replies.
 `;
 
-// Function declarations
-const TOOLS = [
+const toolDeclarations = [
   {
-    functionDeclarations: [
-      {
-        name: 'save_memory',
-        description:
-          'Save a lasting, non-sensitive personal fact or preference.',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            content: {
-              type: 'STRING',
-              description: 'One short self-contained sentence.'
-            }
-          },
-          required: ['content']
+    name: 'save_memory',
+    description: 'Save a useful fact or preference the user explicitly wants remembered.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        content: {
+          type: 'STRING',
+          description: 'The memory to save.'
         }
       },
-      {
-        name: 'recall_memory',
-        description:
-          'Search the user memories for a particular topic.',
-        parameters: {
-          type: 'OBJECT',
-          properties: {
-            query: { type: 'STRING' }
-          },
-          required: ['query']
+      required: ['content']
+    }
+  },
+  {
+    name: 'recall_memory',
+    description: 'Retrieve saved memories relevant to the user request.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        query: {
+          type: 'STRING',
+          description: 'What memory or information to look for.'
         }
       },
-      ...(TAVILY_API_KEY
-        ? [{
-            name: 'web_search',
-            description:
-              'Search the internet for current or factual information.',
-            parameters: {
-              type: 'OBJECT',
-              properties: {
-                query: { type: 'STRING' }
-              },
-              required: ['query']
-            }
-          }]
-        : [])
-    ]
+      required: ['query']
+    }
+  },
+  {
+    name: 'web_search',
+    description: 'Search the web for current information using Tavily.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        query: {
+          type: 'STRING',
+          description: 'The search query.'
+        }
+      },
+      required: ['query']
+    }
   }
 ];
 
-// Fetch and cache conversation context
 async function getUserContext(userId, db) {
   const cached = contextCache.get(userId);
 
@@ -233,94 +205,205 @@ async function getUserContext(userId, db) {
     return cached.value;
   }
 
-  const [memResult, msgResult] = await Promise.all([
+  const [memoryResult, messageResult] = await Promise.all([
     db
       .from('memories')
-      .select('content')
+      .select('content,created_at')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(30),
 
     db
       .from('messages')
-      .select('role,content')
+      .select('role,content,created_at')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(12)
   ]);
 
-  if (memResult.error) {
-    console.error('Memory fetch:', memResult.error.message);
+  if (memoryResult.error) {
+    console.error('Memory context error:', memoryResult.error.message);
   }
 
-  if (msgResult.error) {
-    console.error('Message fetch:', msgResult.error.message);
+  if (messageResult.error) {
+    console.error('Chat context error:', messageResult.error.message);
   }
 
-  const memories = memResult.data || [];
-  const messages = msgResult.data || [];
+  const memories = (memoryResult.data || [])
+    .map(item => item.content)
+    .filter(Boolean);
 
-  const context =
-    `${PERSONA}\nToday is ${new Date().toDateString()}.` +
+  const messages = (messageResult.data || [])
+    .reverse()
+    .map(item => `${item.role}: ${item.content}`)
+    .filter(Boolean);
 
-    (memories.length
-      ? `\nUser memories:\n- ${
-          memories.map(m => m.content).join('\n- ')
-        }`
-      : '') +
+  const value = [
+    memories.length
+      ? `USER MEMORIES:\n${memories.map(x => `- ${x}`).join('\n')}`
+      : 'No saved memories yet.',
+    messages.length
+      ? `RECENT CONVERSATION:\n${messages.join('\n')}`
+      : 'No recent conversation history.'
+  ].join('\n\n');
 
-    (messages.length
-      ? `\nRecent conversation:\n${
-          messages.reverse()
-            .map(m => `${m.role}: ${m.content}`)
-            .join('\n')
-        }`
-      : '');
-
-  contextCache.set(userId, {
-    time: Date.now(),
-    value: context
-  });
-
+  contextCache.set(userId, { time: Date.now(), value });
   trimCache();
 
-  return context;
+  return value;
 }
 
-// Frontend configuration
-app.get('/api/config', (_req, res) => {
-  res.set('Cache-Control', 'no-store');
+async function saveMemory(req, content) {
+  const clean = String(content || '').trim().slice(0, 2000);
+
+  if (!clean) {
+    return { ok: false, message: 'Memory was empty.' };
+  }
+
+  const { error } = await req.db.from('memories').insert({
+    user_id: req.user.id,
+    content: clean
+  });
+
+  if (error) {
+    console.error('Save memory error:', error);
+    return { ok: false, message: 'I could not save that memory.' };
+  }
+
+  clearUserCache(req.user.id);
+
+  return { ok: true, message: 'Memory saved.' };
+}
+
+async function recallMemory(req, query) {
+  const clean = String(query || '').trim();
+
+  const { data, error } = await req.db
+    .from('memories')
+    .select('content,created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(30);
+
+  if (error) {
+    console.error('Recall memory error:', error);
+    return { ok: false, memories: [] };
+  }
+
+  const memories = data || [];
+
+  if (!clean) {
+    return { ok: true, memories };
+  }
+
+  const words = clean.toLowerCase().split(/\s+/).filter(Boolean);
+  const ranked = memories
+    .map(item => {
+      const text = item.content.toLowerCase();
+      const score = words.reduce(
+        (total, word) => total + (text.includes(word) ? 1 : 0),
+        0
+      );
+      return { ...item, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    ok: true,
+    memories: ranked.slice(0, 8).map(({ content, created_at }) => ({
+      content,
+      created_at
+    }))
+  };
+}
+
+async function webSearch(query) {
+  if (!TAVILY_API_KEY) {
+    return { ok: false, message: 'Web search is not configured.' };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        query: String(query || '').slice(0, 500),
+        search_depth: 'basic',
+        max_results: 5,
+        include_answer: true
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Tavily returned ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    return {
+      ok: true,
+      answer: data.answer || '',
+      results: (data.results || []).map(item => ({
+        title: item.title,
+        url: item.url,
+        content: item.content
+      }))
+    };
+  } catch (error) {
+    console.error('Web search error:', error);
+    return { ok: false, message: 'Web search failed or timed out.' };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function resolveVoice(input) {
+  const requested = String(input || '').trim();
+  return VOICES[requested] || VOICES[DEFAULT_VOICE] || 'Aoede';
+}
+
+app.get('/api/config', (req, res) => {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return res.status(500).json({ error: 'Supabase is not configured.' });
+  }
 
   res.json({
-    supabaseUrl: SUPABASE_URL || '',
-    supabaseAnonKey: SUPABASE_ANON_KEY || '',
-    search: !!TAVILY_API_KEY
+    supabaseUrl: SUPABASE_URL,
+    supabaseAnonKey: SUPABASE_ANON_KEY,
+    searchEnabled: Boolean(TAVILY_API_KEY),
+    owner: OWNER_NAME
   });
 });
 
-// Gemini Live temporary token
 app.post('/api/live-token', auth, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
-
   try {
     if (!gemini) {
-      return res.status(500).json({
-        error: 'GEMINI_API_KEY not set'
-      });
+      return res.status(500).json({ error: 'Gemini is not configured.' });
     }
 
-    const systemInstruction = await getUserContext(
-      req.user.id,
-      req.db
-    );
+    const voice = resolveVoice(req.body?.voice);
+    const userContext = await getUserContext(req.user.id, req.db);
 
     const config = {
       responseModalities: ['AUDIO'],
 
-      systemInstruction,
+      systemInstruction: {
+        parts: [
+          {
+            text: `${PERSONA}\n\n${userContext}\n\nRemember: your creator and owner is ${OWNER_NAME}.`
+          }
+        ]
+      },
 
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
-            voiceName: VOICE
+            voiceName: voice
           }
         }
       },
@@ -328,11 +411,19 @@ app.post('/api/live-token', auth, async (req, res) => {
       inputAudioTranscription: {},
       outputAudioTranscription: {},
 
-      tools: TOOLS,
+      tools: [
+        {
+          functionDeclarations: toolDeclarations
+        }
+      ],
 
       realtimeInputConfig: {
         automaticActivityDetection: {
-          disabled: false
+          disabled: false,
+          startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+          endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+          prefixPaddingMs: 20,
+          silenceDurationMs: 350
         }
       }
     };
@@ -340,214 +431,81 @@ app.post('/api/live-token', auth, async (req, res) => {
     const token = await gemini.authTokens.create({
       config: {
         uses: 1,
-
-        expireTime: new Date(
-          Date.now() + 30 * 60 * 1000
-        ).toISOString(),
-
-        newSessionExpireTime: new Date(
-          Date.now() + 60 * 1000
-        ).toISOString(),
-
+        expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        newSessionExpireTime: new Date(Date.now() + 60 * 1000).toISOString(),
         liveConnectConstraints: {
           model: MODEL,
           config
-        },
-
-        httpOptions: {
-          apiVersion: 'v1alpha'
         }
       }
     });
 
-    return res.json({
+    res.json({
       token: token.name,
       model: MODEL,
+      voice,
       config
     });
-
-  } catch (e) {
-    console.error(
-      'Token creation error:',
-      e?.message || e
-    );
-
-    return res.status(502).json({
-      error: 'Could not create Live token'
+  } catch (error) {
+    console.error('Live token error:', error);
+    res.status(500).json({
+      error: 'Could not start the live session.',
+      detail: process.env.NODE_ENV === 'development'
+        ? error.message
+        : undefined
     });
   }
 });
 
-// Gemini function execution
 app.post('/api/tool', auth, async (req, res) => {
-  const { name, args = {} } = req.body || {};
-
   try {
-    // Save memory
+    const name = req.body?.name || req.body?.toolName;
+    const args = req.body?.args || req.body?.arguments || {};
+
+    let result;
+
     if (name === 'save_memory') {
-      const content = String(args.content || '')
-        .trim()
-        .slice(0, 500);
-
-      if (!content) {
-        return res.json({
-          ok: false,
-          error: 'empty'
-        });
-      }
-
-      const { error } = await req.db
-        .from('memories')
-        .insert({ content });
-
-      if (error) {
-        console.error('Save memory:', error.message);
-
-        return res.json({
-          ok: false,
-          error: 'memory save failed'
-        });
-      }
-
-      clearUserCache(req.user.id);
-
-      return res.json({
-        ok: true
-      });
+      result = await saveMemory(req, args.content);
+    } else if (name === 'recall_memory') {
+      result = await recallMemory(req, args.query);
+    } else if (name === 'web_search') {
+      result = await webSearch(args.query);
+    } else {
+      return res.status(400).json({ error: 'Unknown tool.' });
     }
 
-    // Recall memory
-    if (name === 'recall_memory') {
-      const query = String(args.query || '')
-        .replace(/[%,()]/g, ' ')
-        .trim()
-        .slice(0, 80);
-
-      if (!query) {
-        return res.json({
-          ok: true,
-          memories: []
-        });
-      }
-
-      const { data, error } = await req.db
-        .from('memories')
-        .select('content,created_at')
-        .ilike('content', `%${query}%`)
-        .order('created_at', { ascending: false })
-        .limit(8);
-
-      if (error) {
-        console.error('Recall memory:', error.message);
-
-        return res.json({
-          ok: false,
-          error: 'memory lookup failed'
-        });
-      }
-
-      return res.json({
-        ok: true,
-        memories: data || []
-      });
-    }
-
-    // Web search
-    if (name === 'web_search' && TAVILY_API_KEY) {
-      const query = String(args.query || '')
-        .trim()
-        .slice(0, 300);
-
-      if (!query) {
-        return res.json({
-          ok: false,
-          error: 'empty query'
-        });
-      }
-
-      const response = await fetch(
-        'https://api.tavily.com/search',
-        {
-          method: 'POST',
-
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${TAVILY_API_KEY}`
-          },
-
-          body: JSON.stringify({
-            query,
-            max_results: 4,
-            include_answer: true
-          }),
-
-          signal: AbortSignal.timeout(12000)
-        }
-      );
-
-      if (!response.ok) {
-        return res.json({
-          ok: false,
-          error: `search ${response.status}`
-        });
-      }
-
-      const result = await response.json();
-
-      return res.json({
-        ok: true,
-        answer: result.answer || '',
-        results: (result.results || []).map(item => ({
-          title: item.title,
-          url: item.url,
-          content: (item.content || '').slice(0, 400)
-        }))
-      });
-    }
-
-    return res.status(400).json({
-      ok: false,
-      error: 'unknown tool'
-    });
-
-  } catch (e) {
-    console.error(
-      'Tool execution error:',
-      e?.message || e
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error: 'tool failed'
-    });
+    res.json({ result });
+  } catch (error) {
+    console.error('Tool error:', error);
+    res.status(500).json({ error: 'Tool execution failed.' });
   }
 });
 
-// Serve frontend
-app.use(express.static(dist));
+app.use(express.static(dist, {
+  extensions: ['html'],
+  maxAge: '1h'
+}));
 
-app.get('*', (_req, res) => {
+app.get('*', (req, res) => {
   res.sendFile(path.join(dist, 'index.html'));
 });
 
-// Clean rate-limit entries
 setInterval(() => {
   const now = Date.now();
 
-  for (const [id, times] of hits) {
-    const active = times.filter(
-      t => now - t < 60000
-    );
+  for (const [userId, times] of hits) {
+    const recent = times.filter(time => now - time < 60000);
+    if (recent.length) hits.set(userId, recent);
+    else hits.delete(userId);
+  }
 
-    if (active.length) {
-      hits.set(id, active);
-    } else {
-      hits.delete(id);
+  for (const [userId, item] of contextCache) {
+    if (now - item.time > CACHE_TTL * 5) {
+      contextCache.delete(userId);
     }
   }
 }, 60000).unref();
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`Sambhav AI running on port ${PORT}`);
+  console.log(`Sambhav AI server listening on ${PORT}`);
 });
