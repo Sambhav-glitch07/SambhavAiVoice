@@ -4,36 +4,29 @@ const WORKLET = `
 class PCMCapture extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.buffer = new Float32Array(512);
-    this.offset = 0;
+    this.buffer = [];
+    this.length = 0;
   }
 
   process(inputs) {
-    const input = inputs[0]?.[0];
-    if (!input) return true;
+    const channel = inputs[0]?.[0];
 
-    let offset = 0;
+    if (channel) {
+      this.buffer.push(new Float32Array(channel));
+      this.length += channel.length;
 
-    while (offset < input.length) {
-      const count = Math.min(
-        512 - this.offset,
-        input.length - offset
-      );
+      if (this.length >= 512) {
+        const output = new Float32Array(this.length);
+        let offset = 0;
 
-      this.buffer.set(
-        input.subarray(offset, offset + count),
-        this.offset
-      );
+        for (const chunk of this.buffer) {
+          output.set(chunk, offset);
+          offset += chunk.length;
+        }
 
-      this.offset += count;
-      offset += count;
-
-      if (this.offset === 512) {
-        const chunk = this.buffer;
-        this.buffer = new Float32Array(512);
-        this.offset = 0;
-
-        this.port.postMessage(chunk, [chunk.buffer]);
+        this.port.postMessage(output, [output.buffer]);
+        this.buffer = [];
+        this.length = 0;
       }
     }
 
@@ -41,452 +34,601 @@ class PCMCapture extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor('pcm-cap', PCMCapture);
+registerProcessor('pcm-capture', PCMCapture);
 `;
 
-const b64 = data => {
+function toBase64(bytes) {
   let binary = '';
-  for (let i = 0; i < data.length; i += 8192) {
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
     binary += String.fromCharCode(
-      ...data.subarray(i, i + 8192)
+      ...bytes.subarray(i, i + chunkSize)
     );
   }
+
   return btoa(binary);
-};
+}
 
-const unb64 = data =>
-  Uint8Array.from(atob(data), c => c.charCodeAt(0));
+function fromBase64(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
 
-function level(analyser, time, freq) {
-  if (!analyser) return { rms: 0, bass: 0 };
-
-  analyser.getByteTimeDomainData(time);
-
-  let sum = 0;
-
-  for (let i = 0; i < time.length; i++) {
-    const v = (time[i] - 128) / 128;
-    sum += v * v;
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
   }
 
-  analyser.getByteFrequencyData(freq);
+  return bytes;
+}
 
-  let bass = 0;
+function floatToPCM16(input) {
+  const output = new Int16Array(input.length);
 
-  for (let i = 1; i < 9; i++) {
-    bass += freq[i];
+  for (let i = 0; i < input.length; i++) {
+    const sample = Math.max(-1, Math.min(1, input[i]));
+    output[i] = sample < 0
+      ? sample * 0x8000
+      : sample * 0x7fff;
   }
 
-  return {
-    rms: Math.min(1, Math.sqrt(sum / time.length) * 3.2),
-    bass: Math.min(1, bass / 8 / 255 * 1.2)
-  };
+  return output;
+}
+
+function resample(input, fromRate, toRate) {
+  if (fromRate === toRate) return input;
+
+  const ratio = fromRate / toRate;
+  const length = Math.floor(input.length / ratio);
+  const output = new Float32Array(length);
+
+  for (let i = 0; i < length; i++) {
+    const position = i * ratio;
+    const left = Math.floor(position);
+    const right = Math.min(left + 1, input.length - 1);
+    const fraction = position - left;
+
+    output[i] =
+      input[left] * (1 - fraction) +
+      input[right] * fraction;
+  }
+
+  return output;
+}
+
+function rms(analyser, data) {
+  if (!analyser) return 0;
+
+  analyser.getByteTimeDomainData(data);
+
+  let total = 0;
+
+  for (let i = 0; i < data.length; i++) {
+    const value = (data[i] - 128) / 128;
+    total += value * value;
+  }
+
+  return Math.sqrt(total / data.length);
 }
 
 export class Live {
-  constructor(h) {
-    this.h = h;
+  constructor(handlers = {}) {
+    this.h = handlers;
+
     this.active = false;
-    this.muted = false;
-    this.q = new Set();
-    this.next = 0;
+    this.starting = false;
+    this.micMuted = false;
+    this.speakerMuted = false;
+
+    this.stream = null;
+    this.ctx = null;
+    this.session = null;
+
+    this.source = null;
+    this.capture = null;
+    this.silentGain = null;
+
+    this.inputAnalyser = null;
+    this.outputAnalyser = null;
+    this.outputGain = null;
+
+    this.queue = new Set();
+    this.nextPlaybackTime = 0;
+
     this.generation = 0;
-    this.reset();
+    this.lastVoiceAt = 0;
+    this.lastOutputAt = 0;
+    this.levelTimer = null;
+
+    this.micMeter = new Uint8Array(1024);
+    this.outputMeter = new Uint8Array(1024);
+
+    this.workletUrl = null;
   }
 
-  reset() {
-    this.uText = '';
-    this.aText = '';
-    this.turnDone = true;
-    this.speechAt = 0;
-    this.lastLoud = 0;
-    this.gotOutput = false;
-  }
-
-  mic() {
-    return !this.muted
-      ? level(this.micAn, this.micBuf, this.micFq)
-      : { rms: 0, bass: 0 };
-  }
-
-  out() {
-    return level(this.outAn, this.outBuf, this.outFq);
+  emitMode(mode) {
+    this.h.mode?.(mode);
+    this.h.state?.(mode);
   }
 
   async start() {
-    if (this.active) return;
+    if (this.active || this.starting) return;
 
-    this.active = true;
+    this.starting = true;
     const generation = ++this.generation;
 
-    this.h.state('connecting');
+    this.emitMode('connecting');
 
     try {
-      const stream = this.stream =
-        await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 1
-          }
-        });
+      const jwt = await this.h.jwt?.();
 
-      const ctx = this.ctx =
-        new AudioContext({ latencyHint: 'interactive' });
-
-      await ctx.resume();
-
-      const analyser = fft => {
-        const a = ctx.createAnalyser();
-        a.fftSize = fft;
-        a.smoothingTimeConstant = 0.45;
-        return a;
-      };
-
-      const source = ctx.createMediaStreamSource(stream);
-
-      this.micAn = analyser(512);
-      this.micBuf = new Uint8Array(512);
-      this.micFq = new Uint8Array(256);
-      source.connect(this.micAn);
-
-      this.outAn = analyser(512);
-      this.outBuf = new Uint8Array(512);
-      this.outFq = new Uint8Array(256);
-      this.outAn.connect(ctx.destination);
-
-      const url = URL.createObjectURL(
-        new Blob([WORKLET], { type: 'text/javascript' })
-      );
-
-      try {
-        await ctx.audioWorklet.addModule(url);
-      } finally {
-        URL.revokeObjectURL(url);
+      if (!jwt) {
+        throw new Error('Please sign in before starting a conversation.');
       }
 
-      const node = this.node =
-        new AudioWorkletNode(ctx, 'pcm-cap');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
 
-      const silent = ctx.createGain();
-      silent.gain.value = 0;
+      if (generation !== this.generation) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
 
-      source.connect(node);
-      node.connect(silent);
-      silent.connect(ctx.destination);
+      this.stream = stream;
 
-      const ratio = ctx.sampleRate / 16000;
+      const AudioContextClass =
+        window.AudioContext || window.webkitAudioContext;
 
-      node.port.onmessage = event => {
-        if (!this.active || !this.session || this.muted) return;
+      this.ctx = new AudioContextClass({
+        latencyHint: 'interactive'
+      });
+
+      await this.ctx.resume();
+
+      if (generation !== this.generation) {
+        await this.cleanupAudio();
+        return;
+      }
+
+      this.inputAnalyser = this.ctx.createAnalyser();
+      this.inputAnalyser.fftSize = 1024;
+      this.inputAnalyser.smoothingTimeConstant = 0.7;
+
+      this.outputAnalyser = this.ctx.createAnalyser();
+      this.outputAnalyser.fftSize = 1024;
+      this.outputAnalyser.smoothingTimeConstant = 0.65;
+
+      this.outputGain = this.ctx.createGain();
+      this.outputGain.gain.value = this.speakerMuted ? 0 : 1;
+
+      this.outputAnalyser.connect(this.outputGain);
+      this.outputGain.connect(this.ctx.destination);
+
+      this.source = this.ctx.createMediaStreamSource(stream);
+      this.source.connect(this.inputAnalyser);
+
+      const blob = new Blob([WORKLET], {
+        type: 'application/javascript'
+      });
+
+      this.workletUrl = URL.createObjectURL(blob);
+
+      await this.ctx.audioWorklet.addModule(this.workletUrl);
+
+      if (generation !== this.generation) {
+        await this.cleanupAudio();
+        return;
+      }
+
+      this.capture = new AudioWorkletNode(
+        this.ctx,
+        'pcm-capture',
+        {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          channelCount: 1,
+          channelCountMode: 'explicit'
+        }
+      );
+
+      this.silentGain = this.ctx.createGain();
+      this.silentGain.gain.value = 0;
+
+      this.source.connect(this.capture);
+      this.capture.connect(this.silentGain);
+      this.silentGain.connect(this.ctx.destination);
+
+      this.capture.port.onmessage = event => {
+        if (
+          !this.active ||
+          this.micMuted ||
+          !this.session ||
+          generation !== this.generation
+        ) {
+          return;
+        }
 
         const input = event.data;
-        const count = Math.floor(input.length / ratio);
 
-        if (!count) return;
+        if (!(input instanceof Float32Array)) return;
 
-        const output = new Int16Array(count);
+        const converted = resample(
+          input,
+          this.ctx.sampleRate,
+          16000
+        );
 
-        for (let i = 0; i < count; i++) {
-          const start = Math.floor(i * ratio);
-          const end = Math.min(
-            input.length,
-            Math.floor((i + 1) * ratio)
-          );
+        if (!converted.length) return;
 
-          let sum = 0;
+        const pcm = floatToPCM16(converted);
 
-          for (let j = start; j < end; j++) {
-            sum += input[j];
+        this.session.sendRealtimeInput({
+          audio: {
+            data: toBase64(
+              new Uint8Array(
+                pcm.buffer,
+                pcm.byteOffset,
+                pcm.byteLength
+              )
+            ),
+            mimeType: 'audio/pcm;rate=16000'
           }
-
-          const sample = Math.max(
-            -1,
-            Math.min(1, sum / Math.max(1, end - start))
-          );
-
-          output[i] = sample < 0
-            ? sample * 32768
-            : sample * 32767;
-        }
-
-        try {
-          this.session.sendRealtimeInput({
-            audio: {
-              data: b64(new Uint8Array(output.buffer)),
-              mimeType: 'audio/pcm;rate=16000'
-            }
-          });
-        } catch (error) {
-          console.warn('Audio send failed', error);
-        }
+        });
       };
 
-      // Request a short-lived token from your backend.
       const response = await fetch('/api/live-token', {
         method: 'POST',
         headers: {
-          Authorization: 'Bearer ' + await this.h.jwt()
-        }
+          Authorization: `Bearer ${jwt}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          voice: this.h.voice?.() || 'female'
+        })
       });
 
-      const data = await response.json();
+      const tokenData = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Token request failed');
+      if (!response.ok || !tokenData.token) {
+        throw new Error(
+          tokenData.error || 'Could not create a live session.'
+        );
       }
 
-      if (!this.active || generation !== this.generation) return;
+      if (generation !== this.generation) {
+        await this.cleanupAudio();
+        return;
+      }
 
       const ai = new GoogleGenAI({
-        apiKey: data.token,
-        httpOptions: { apiVersion: 'v1alpha' }
+        apiKey: tokenData.token
       });
 
       const session = await ai.live.connect({
-        model: data.model,
-        config: data.config,
+        model: tokenData.model,
+        config: tokenData.config,
+
         callbacks: {
           onopen: () => {
             if (generation !== this.generation) return;
-            this.h.state('listening');
-            this.h.opened?.();
+
+            this.active = true;
+            this.starting = false;
+            this.lastVoiceAt = Date.now();
+
+            this.emitMode('listening');
+            this.startMeter();
           },
 
           onmessage: message => {
-            if (generation === this.generation) {
-              this.msg(message);
-            }
+            if (generation !== this.generation) return;
+            this.handleMessage(message);
           },
 
           onerror: error => {
-            if (generation === this.generation) {
-              this.h.error(
-                error?.message || 'Gemini connection error'
-              );
-            }
+            if (generation !== this.generation) return;
+
+            console.error('Live session error:', error);
+            this.h.error?.(
+              error?.message || 'Live connection error.'
+            );
           },
 
-          onclose: () => {
-            if (generation === this.generation) this.stop();
+          onclose: event => {
+            if (generation !== this.generation) return;
+
+            this.active = false;
+            this.starting = false;
+            this.session = null;
+
+            this.stopMeter();
+            this.flush();
+
+            this.h.closed?.(event);
+            this.emitMode('ended');
           }
         }
       });
 
-      if (!this.active || generation !== this.generation) {
-        session.close();
+      if (generation !== this.generation) {
+        try {
+          session.close();
+        } catch {}
+
+        await this.cleanupAudio();
         return;
       }
 
       this.session = session;
-      this.timer = setInterval(() => this.tick(), 75);
-
     } catch (error) {
+      console.error('Live start error:', error);
+
       if (generation === this.generation) {
-        this.stop();
-        throw error;
+        this.active = false;
+        this.starting = false;
+
+        await this.cleanupAudio();
+
+        this.h.error?.(
+          error?.message || 'Could not start the conversation.'
+        );
+
+        this.emitMode('error');
       }
     }
   }
 
-  tick() {
-    if (!this.active) return;
+  handleMessage(message) {
+    const server = message?.serverContent;
 
-    const now = performance.now();
-    const audio = this.mic();
-
-    if (audio.rms > 0.14) {
-      this.speechAt = now;
-      this.lastLoud = now;
+    if (message?.toolCall?.functionCalls?.length) {
+      this.handleTools(message.toolCall.functionCalls);
     }
 
-    if (
-      this.h.mode() === 'listening' &&
-      this.speechAt &&
-      !this.gotOutput &&
-      now - this.lastLoud > 400
-    ) {
-      this.h.state('thinking');
-    }
-  }
+    if (!server) return;
 
-  msg(message) {
-    const content = message.serverContent;
+    const inputText =
+      server.inputTranscription?.text;
 
-    if (message.toolCall?.functionCalls) {
-      this.tools(message.toolCall.functionCalls);
+    if (inputText) {
+      this.h.transcript?.('user', inputText);
+      this.h.save?.('user', inputText);
     }
 
-    if (!content) return;
+    const outputText =
+      server.outputTranscription?.text;
 
-    if (content.interrupted) {
+    if (outputText) {
+      this.h.transcript?.('assistant', outputText);
+      this.h.save?.('assistant', outputText);
+    }
+
+    if (server.interrupted) {
       this.flush();
-      this.persist();
-      this.h.state('listening');
+      this.emitMode('listening');
     }
 
-    if (content.inputTranscription?.text) {
-      this.uText += content.inputTranscription.text;
-      this.turnDone = false;
-      this.h.transcript(this.uText, this.aText);
-    }
+    const parts = server.modelTurn?.parts || [];
 
-    if (content.outputTranscription?.text) {
-      this.aText += content.outputTranscription.text;
-      this.h.transcript(this.uText, this.aText);
-    }
+    for (const part of parts) {
+      const data = part?.inlineData?.data;
 
-    for (const part of content.modelTurn?.parts || []) {
-      if (
-        part.inlineData?.data &&
-        /audio\/pcm/i.test(part.inlineData.mimeType || '')
-      ) {
-        this.play(part.inlineData.data);
+      if (data) {
+        this.play(data);
       }
     }
 
-    if (content.turnComplete) {
-      this.persist();
-      this.turnDone = true;
-      this.gotOutput = false;
-      this.speechAt = 0;
-
-      if (!this.q.size) {
-        this.h.state('listening');
-      }
+    if (server.turnComplete) {
+      this.emitMode('listening');
+    } else if (parts.length) {
+      this.emitMode('speaking');
     }
   }
 
-  play(data) {
-    if (!this.ctx || !this.active) return;
-
-    const bytes = unb64(data);
-
-    const samples = new Int16Array(
-      bytes.buffer,
-      bytes.byteOffset,
-      Math.floor(bytes.byteLength / 2)
-    );
-
-    const buffer = this.ctx.createBuffer(
-      1,
-      samples.length,
-      24000
-    );
-
-    const channel = buffer.getChannelData(0);
-
-    for (let i = 0; i < samples.length; i++) {
-      channel[i] = samples[i] / 32768;
-    }
-
-    const source = this.ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(this.outAn);
-
-    const startAt = Math.max(
-      this.next,
-      this.ctx.currentTime + 0.015
-    );
-
-    source.start(startAt);
-    this.next = startAt + buffer.duration;
-
-    this.q.add(source);
-    this.gotOutput = true;
-
-    this.h.state('speaking');
-
-    source.onended = () => {
-      this.q.delete(source);
-
-      if (!this.q.size && this.turnDone && this.active) {
-        this.h.state('listening');
-      }
-    };
-  }
-
-  flush() {
-    for (const source of this.q) {
-      source.onended = null;
-
+  async handleTools(functionCalls) {
+    for (const call of functionCalls) {
       try {
-        source.stop();
-      } catch {}
-    }
+        const jwt = await this.h.jwt?.();
 
-    this.q.clear();
-    this.next = 0;
-    this.gotOutput = false;
+        const response = await fetch('/api/tool', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${jwt}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name: call.name,
+            args: call.args || {}
+          })
+        });
+
+        const data = await response.json();
+
+        this.session?.sendToolResponse({
+          functionResponses: [{
+            id: call.id,
+            name: call.name,
+            response: data.result || data
+          }]
+        });
+      } catch (error) {
+        console.error('Tool call error:', error);
+
+        this.session?.sendToolResponse({
+          functionResponses: [{
+            id: call.id,
+            name: call.name,
+            response: {
+              ok: false,
+              error: 'Tool execution failed.'
+            }
+          }]
+        });
+      }
+    }
+  }
+
+  play(base64) {
+    if (!this.ctx || !this.outputAnalyser) return;
+
+    try {
+      const bytes = fromBase64(base64);
+      const samples = new Int16Array(
+        bytes.buffer,
+        bytes.byteOffset,
+        Math.floor(bytes.byteLength / 2)
+      );
+
+      const audio = this.ctx.createBuffer(
+        1,
+        samples.length,
+        24000
+      );
+
+      const channel = audio.getChannelData(0);
+
+      for (let i = 0; i < samples.length; i++) {
+        channel[i] = samples[i] / 32768;
+      }
+
+      const source = this.ctx.createBufferSource();
+      source.buffer = audio;
+      source.connect(this.outputAnalyser);
+
+      const startAt = Math.max(
+        this.ctx.currentTime + 0.015,
+        this.nextPlaybackTime
+      );
+
+      this.nextPlaybackTime = startAt + audio.duration;
+
+      this.queue.add(source);
+
+      source.onended = () => {
+        this.queue.delete(source);
+
+        if (!this.queue.size && this.active) {
+          this.emitMode('listening');
+        }
+      };
+
+      source.start(startAt);
+
+      this.lastOutputAt = Date.now();
+      this.emitMode('speaking');
+    } catch (error) {
+      console.error('Audio playback error:', error);
+    }
+  }
+
+  startMeter() {
+    this.stopMeter();
+
+    this.levelTimer = setInterval(() => {
+      if (!this.active) return;
+
+      const inputLevel = rms(
+        this.inputAnalyser,
+        this.micMeter
+      );
+
+      const outputLevel = rms(
+        this.outputAnalyser,
+        this.outputMeter
+      );
+
+      this.h.level?.({
+        input: inputLevel,
+        output: outputLevel
+      });
+
+      if (
+        outputLevel > 0.018 ||
+        Date.now() - this.lastOutputAt < 250
+      ) {
+        this.emitMode('speaking');
+      } else if (inputLevel > 0.025) {
+        this.lastVoiceAt = Date.now();
+        this.emitMode('listening');
+      }
+    }, 80);
+  }
+
+  stopMeter() {
+    if (this.levelTimer) {
+      clearInterval(this.levelTimer);
+      this.levelTimer = null;
+    }
   }
 
   interrupt() {
     this.flush();
-    this.h.state('listening');
-  }
-
-  async tools(calls) {
-    this.h.state('thinking');
-
-    const responses = await Promise.all(
-      calls.map(async call => {
-        try {
-          const response = await fetch('/api/tool', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: 'Bearer ' + await this.h.jwt()
-            },
-            body: JSON.stringify({
-              name: call.name,
-              args: call.args
-            })
-          });
-
-          return {
-            id: call.id,
-            name: call.name,
-            response: await response.json()
-          };
-        } catch {
-          return {
-            id: call.id,
-            name: call.name,
-            response: { ok: false, error: 'network' }
-          };
-        }
-      })
-    );
 
     try {
-      this.session?.sendToolResponse({
-        functionResponses: responses
+      this.session?.sendRealtimeInput({
+        audioStreamEnd: true
       });
-    } catch (error) {
-      console.warn('Tool response failed', error);
+    } catch {}
+
+    if (this.active) {
+      this.emitMode('listening');
     }
   }
 
-  persist() {
-    const user = this.uText.trim();
-    const assistant = this.aText.trim();
+  flush() {
+    for (const source of this.queue) {
+      try {
+        source.stop();
+      } catch {}
 
-    this.uText = '';
-    this.aText = '';
+      try {
+        source.disconnect();
+      } catch {}
+    }
 
-    if (user) this.h.save('user', user);
-    if (assistant) this.h.save('assistant', assistant);
+    this.queue.clear();
+
+    if (this.ctx) {
+      this.nextPlaybackTime = this.ctx.currentTime;
+    } else {
+      this.nextPlaybackTime = 0;
+    }
   }
 
-  setMuted(value) {
-    this.muted = value;
+  setSpeakerMuted(muted) {
+    this.speakerMuted = Boolean(muted);
 
-    this.stream?.getAudioTracks().forEach(
-      track => track.enabled = !value
-    );
+    if (this.outputGain && this.ctx) {
+      this.outputGain.gain.setTargetAtTime(
+        this.speakerMuted ? 0 : 1,
+        this.ctx.currentTime,
+        0.015
+      );
+    }
 
-    if (value) {
+    this.h.speakerMuted?.(this.speakerMuted);
+  }
+
+  // Kept as an alias for compatibility with older main.js code.
+  setMuted(muted) {
+    this.setSpeakerMuted(muted);
+  }
+
+  setMicMuted(muted) {
+    this.micMuted = Boolean(muted);
+
+    if (this.stream) {
+      for (const track of this.stream.getAudioTracks()) {
+        track.enabled = !this.micMuted;
+      }
+    }
+
+    if (this.micMuted) {
       try {
         this.session?.sendRealtimeInput({
           audioStreamEnd: true
@@ -495,40 +637,70 @@ export class Live {
     }
   }
 
-  stop() {
-    if (!this.active) return;
+  async cleanupAudio() {
+    this.stopMeter();
+    this.flush();
+
+    if (this.capture) {
+      this.capture.port.onmessage = null;
+      try { this.capture.disconnect(); } catch {}
+      this.capture = null;
+    }
+
+    for (const node of [
+      this.source,
+      this.inputAnalyser,
+      this.outputAnalyser,
+      this.outputGain,
+      this.silentGain
+    ]) {
+      try { node?.disconnect(); } catch {}
+    }
+
+    this.source = null;
+    this.inputAnalyser = null;
+    this.outputAnalyser = null;
+    this.outputGain = null;
+    this.silentGain = null;
+
+    if (this.stream) {
+      this.stream.getTracks().forEach(track => track.stop());
+      this.stream = null;
+    }
+
+    if (this.workletUrl) {
+      URL.revokeObjectURL(this.workletUrl);
+      this.workletUrl = null;
+    }
+
+    if (this.ctx) {
+      const context = this.ctx;
+      this.ctx = null;
+
+      try {
+        await context.close();
+      } catch {}
+    }
+  }
+
+  async stop() {
+    ++this.generation;
 
     this.active = false;
-    this.generation++;
+    this.starting = false;
 
-    clearInterval(this.timer);
+    const session = this.session;
+    this.session = null;
 
-    this.persist();
+    this.stopMeter();
     this.flush();
 
     try {
-      this.session?.close();
+      session?.close();
     } catch {}
 
-    this.session = null;
+    await this.cleanupAudio();
 
-    this.stream?.getTracks().forEach(track => track.stop());
-
-    try {
-      this.node?.disconnect();
-    } catch {}
-
-    try {
-      this.ctx?.close();
-    } catch {}
-
-    this.stream = null;
-    this.node = null;
-    this.ctx = null;
-    this.micAn = null;
-    this.outAn = null;
-
-    this.reset();
-    this.h.state('idle');
+    this.emitMode('ended');
   }
 }
