@@ -1,11 +1,14 @@
-
 import { GoogleGenAI } from '@google/genai';
 
+// LATENCY FIX: ~40ms chunks instead of 512-sample (~10ms) chunks,
+// so far fewer tiny WebSocket messages are sent per second.
 const WORKLET = `
+const SIZE = Math.round(sampleRate * 0.04);
+
 class PCMCapture extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.buffer = new Float32Array(512);
+    this.buffer = new Float32Array(SIZE);
     this.offset = 0;
   }
 
@@ -16,15 +19,15 @@ class PCMCapture extends AudioWorkletProcessor {
     let i = 0;
 
     while (i < input.length) {
-      const count = Math.min(512 - this.offset, input.length - i);
+      const count = Math.min(SIZE - this.offset, input.length - i);
 
       this.buffer.set(input.subarray(i, i + count), this.offset);
       this.offset += count;
       i += count;
 
-      if (this.offset === 512) {
+      if (this.offset === SIZE) {
         const output = this.buffer;
-        this.buffer = new Float32Array(512);
+        this.buffer = new Float32Array(SIZE);
         this.offset = 0;
         this.port.postMessage(output, [output.buffer]);
       }
@@ -89,6 +92,7 @@ export class Live {
     this.turnDone = true;
     this.speechAt = 0;
     this.lastLoud = 0;
+    this.tLoud = 0;
     this.gotOutput = false;
     this.stopping = false;
   }
@@ -284,6 +288,7 @@ export class Live {
     if (level.rms > 0.14) {
       this.speechAt = now;
       this.lastLoud = now;
+      this.tLoud = now; // latency timer reference
     }
 
     if (
@@ -347,6 +352,15 @@ export class Live {
 
   play(data) {
     if (!this.ctx || !this.active) return;
+
+    // Latency timer: last loud mic moment -> first AI audio
+    if (!this.gotOutput && this.tLoud) {
+      console.log(
+        '[lat] you stopped → first AI audio:',
+        Math.round(performance.now() - this.tLoud),
+        'ms'
+      );
+    }
 
     const bytes = decode(data);
 
@@ -421,6 +435,8 @@ export class Live {
   async tools(calls) {
     this.h.state('thinking');
 
+    const t0 = performance.now();
+
     const responses = await Promise.all(
       calls.map(async call => {
         try {
@@ -455,6 +471,13 @@ export class Live {
           };
         }
       })
+    );
+
+    console.log(
+      '[lat] tools',
+      calls.map(c => c.name).join(','),
+      Math.round(performance.now() - t0),
+      'ms'
     );
 
     try {
