@@ -1,4 +1,3 @@
-
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,6 +44,9 @@ const gemini = GEMINI_API_KEY
 const contextCache = new Map();
 const hits = new Map();
 
+// LATENCY FIX: cache verified logins so tool calls skip a Supabase round trip
+const jwtCache = new Map(); // jwt -> { user, until }
+
 function dbFor(jwt) {
   return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: {
@@ -85,15 +87,27 @@ async function auth(req, res, next) {
 
   try {
     const db = dbFor(jwt);
-    const { data, error } = await db.auth.getUser(jwt);
 
-    if (error || !data?.user) {
-      return res.status(401).json({
-        error: 'Invalid session'
-      });
+    let cachedUser = jwtCache.get(jwt);
+
+    if (!cachedUser || cachedUser.until < Date.now()) {
+      const { data, error } = await db.auth.getUser(jwt);
+
+      if (error || !data?.user) {
+        return res.status(401).json({
+          error: 'Invalid session'
+        });
+      }
+
+      cachedUser = { user: data.user, until: Date.now() + 60000 };
+      jwtCache.set(jwt, cachedUser);
+
+      if (jwtCache.size > MAX_CACHE_ENTRIES) {
+        jwtCache.delete(jwtCache.keys().next().value);
+      }
     }
 
-    const userId = data.user.id;
+    const userId = cachedUser.user.id;
     const now = Date.now();
 
     const recent = (hits.get(userId) || [])
@@ -108,7 +122,7 @@ async function auth(req, res, next) {
     recent.push(now);
     hits.set(userId, recent);
 
-    req.user = data.user;
+    req.user = cachedUser.user;
     req.db = db;
 
     next();
@@ -174,6 +188,14 @@ Use web_search for current information when needed.
 Never claim you searched unless the tool succeeds.
 
 Be honest, helpful, confident and conversational.
+
+SPEED — IMPORTANT:
+
+Reply immediately in one or two short sentences.
+Do NOT call any tool for greetings, chit-chat, opinions, or general knowledge.
+Everything listed under "User memories" below is already known to you, so do not call recall_memory for it.
+Call save_memory only when the user clearly shares something worth keeping.
+Call web_search only for live or current information the user asks for.
 `;
 
 // Function declarations
@@ -330,9 +352,25 @@ app.post('/api/live-token', auth, async (req, res) => {
 
       tools: TOOLS,
 
+      // LATENCY FIX: optional thinking control.
+      // Set GEMINI_THINKING_BUDGET=0 in .env to try disabling thinking.
+      // If the connection fails after setting it, remove the variable.
+      ...(process.env.GEMINI_THINKING_BUDGET !== undefined
+        ? {
+            thinkingConfig: {
+              thinkingBudget: Number(process.env.GEMINI_THINKING_BUDGET)
+            }
+          }
+        : {}),
+
+      // LATENCY FIX: faster end-of-speech detection
       realtimeInputConfig: {
         automaticActivityDetection: {
-          disabled: false
+          disabled: false,
+          startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+          endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+          prefixPaddingMs: 20,
+          silenceDurationMs: 500
         }
       }
     };
@@ -475,13 +513,14 @@ app.post('/api/tool', auth, async (req, res) => {
             Authorization: `Bearer ${TAVILY_API_KEY}`
           },
 
+          // LATENCY FIX: fewer results, no generated answer, shorter timeout
           body: JSON.stringify({
             query,
-            max_results: 4,
-            include_answer: true
+            max_results: 3,
+            include_answer: false
           }),
 
-          signal: AbortSignal.timeout(12000)
+          signal: AbortSignal.timeout(6000)
         }
       );
 
