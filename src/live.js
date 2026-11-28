@@ -141,6 +141,8 @@ export class Live {
     this.speechAt = 0;
     this.lastLoud = 0;
     this.tLoud = 0;
+    this.tIn = 0;
+    this.toolMs = 0;
     this.gotOutput = false;
     this.stopping = false;
   }
@@ -382,6 +384,7 @@ export class Live {
 
     if (content.inputTranscription?.text) {
       this.uText += content.inputTranscription.text;
+      this.tIn = performance.now();
       this.turnDone = false;
 
       this.h.transcript(this.uText, this.aText);
@@ -419,10 +422,13 @@ export class Live {
 
     // Latency timer: last loud mic moment -> first AI audio
     if (!this.gotOutput && this.tLoud) {
-      const ms = Math.round(performance.now() - this.tLoud);
-      console.log('[lat] you stopped → first AI audio:', ms, 'ms');
-      this.h.latency?.(ms);
+      const now = performance.now();
+      const ms = Math.round(now - this.tLoud);
+      const info = { afterTranscript: this.tIn ? Math.round(now - this.tIn) : -1, tool: this.toolMs || 0 };
+      console.log('[lat] you stopped → first AI audio:', ms, 'ms', info);
+      this.h.latency?.(ms, info);
       this.tLoud = 0;
+      this.toolMs = 0;
     }
 
     const bytes = decode(data);
@@ -537,12 +543,8 @@ export class Live {
       })
     );
 
-    console.log(
-      '[lat] tools',
-      calls.map(c => c.name).join(','),
-      Math.round(performance.now() - t0),
-      'ms'
-    );
+    this.toolMs = (this.toolMs || 0) + Math.round(performance.now() - t0);
+    console.log('[lat] tools', calls.map(c => c.name).join(','), this.toolMs, 'ms');
 
     try {
       this.session?.sendToolResponse({
