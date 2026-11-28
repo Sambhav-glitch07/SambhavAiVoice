@@ -8,6 +8,7 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://generativelanguage.googleapis.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;300;400;500;600&display=swap" rel="stylesheet">
 
 <style>
@@ -249,6 +250,34 @@ svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6;stroke
  50%{box-shadow:0 0 0 12px rgba(255,255,255,0),0 0 55px rgba(255,255,255,.2)}
 }
 
+/* ================= VOICE PICKER ================= */
+#voiceWrap{position:absolute;top:44px;left:50%;transform:translateX(-50%);z-index:3}
+#vb{
+ display:flex;align-items:center;gap:7px;padding:8px 14px;border:1px solid var(--line);border-radius:999px;
+ background:linear-gradient(150deg,rgba(255,255,255,.10),rgba(255,255,255,.03));color:var(--dim);cursor:pointer;
+ font-size:10px;font-weight:400;letter-spacing:.14em;text-transform:uppercase;white-space:nowrap;
+ backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);transition:color .3s,border-color .3s;
+}
+#vb span{color:#fff}
+#vb:hover,#vb[aria-expanded="true"]{color:#fff;border-color:rgba(255,255,255,.4)}
+#vb:focus-visible{outline:2px solid #fff;outline-offset:3px}
+#vp{
+ display:none;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:176px;padding:6px;
+ border:1px solid rgba(255,255,255,.16);border-radius:18px;
+ background:linear-gradient(145deg,rgba(255,255,255,.12),rgba(255,255,255,.03)),rgba(10,10,12,.7);
+ backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
+ box-shadow:inset 0 1px 0 rgba(255,255,255,.2),0 20px 60px rgba(0,0,0,.5);
+}
+#vp.show{display:block;animation:authUp .35s var(--ease)}
+#vp button{
+ display:flex;align-items:center;justify-content:space-between;width:100%;padding:11px 14px;border:0;border-radius:12px;
+ background:none;color:#cfcfd3;font-size:13px;font-weight:300;letter-spacing:.04em;cursor:pointer;text-align:left;transition:background .25s,color .25s;
+}
+#vp button:hover{background:rgba(255,255,255,.09);color:#fff}
+#vp button:focus-visible{outline:2px solid #fff;outline-offset:-2px}
+#vp button[aria-checked="true"]{color:#fff;font-weight:500}
+#vp button[aria-checked="true"]:after{content:"";width:6px;height:6px;border-radius:50%;background:#fff;box-shadow:0 0 10px rgba(255,255,255,.8)}
+
 /* WebGL error */
 #err{
  position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:30px;
@@ -397,6 +426,17 @@ svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6;stroke
   </button>
 
   <div class="mark">SAMBHAV AI</div>
+
+  <div id="voiceWrap">
+   <button id="vb" aria-haspopup="true" aria-expanded="false" aria-controls="vp">Voice · <span>Female</span></button>
+   <div id="vp" role="radiogroup" aria-label="Voice">
+    <button role="radio" aria-checked="false" data-v="male">Male</button>
+    <button role="radio" aria-checked="false" data-v="female">Female</button>
+    <button role="radio" aria-checked="false" data-v="boy">Boy</button>
+    <button role="radio" aria-checked="false" data-v="girl">Girl</button>
+    <button role="radio" aria-checked="false" data-v="robot">Robot</button>
+   </div>
+  </div>
 
   <button
    class="tbtn"
