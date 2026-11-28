@@ -1,5 +1,14 @@
 import { GoogleGenAI } from '@google/genai';
 
+// Client-side voice effects. rate>1 raises pitch (and speed) slightly; ring = robot ring-modulator.
+const FX = {
+  male:   { rate: 1,    ring: 0 },
+  female: { rate: 1,    ring: 0 },
+  boy:    { rate: 1.1,  ring: 0 },
+  girl:   { rate: 1.08, ring: 0 },
+  robot:  { rate: 1,    ring: 1 }
+};
+
 // LATENCY FIX: ~40ms chunks instead of 512-sample (~10ms) chunks,
 // so far fewer tiny WebSocket messages are sent per second.
 const WORKLET = `
@@ -83,7 +92,46 @@ export class Live {
     this.muted = false;
     this.sources = new Set();
     this.nextAudioTime = 0;
+    this.warm = null;
+    this.warmAt = 0;
+    this.voiceKey = 'female';
     this.reset();
+  }
+
+  // Takes effect on the next connection (Gemini fixes the voice when a session opens).
+  setVoice(key) {
+    this.voiceKey = FX[key] ? key : 'female';
+    this.warm = null; // a prewarmed token was made for the old voice
+  }
+
+  // SPEED: fetch the Gemini token (server round trip) without waiting on anything else
+  async fetchToken() {
+    const response = await fetch('/api/live-token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await this.h.jwt()}`
+      },
+      body: JSON.stringify({ voice: this.voiceKey })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Live token failed');
+    return result;
+  }
+
+  // Call when the user is about to start (pointer down / hover). Token is valid ~60s, so reuse within 45s.
+  prewarm() {
+    if (this.active) return;
+    if (this.warm && performance.now() - this.warmAt < 40000) return;
+    this.warmAt = performance.now();
+    this.warm = this.fetchToken().catch(() => null);
+  }
+
+  takeToken() {
+    const w = this.warm;
+    this.warm = null;
+    if (w && performance.now() - this.warmAt < 45000) return w.then(r => r || this.fetchToken());
+    return this.fetchToken();
   }
 
   reset() {
@@ -112,6 +160,10 @@ export class Live {
 
     this.active = true;
     this.h.state('connecting');
+
+    // Start the token request immediately, in parallel with microphone/audio setup.
+    const tokenP = this.takeToken();
+    tokenP.catch(() => {});
 
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -154,6 +206,29 @@ export class Live {
       this.outFq = new Uint8Array(256);
 
       this.outAn.connect(ctx.destination);
+
+      // Voice effects bus: AI audio -> bus -> (dry + optional robot ring-mod) -> analyser -> speakers
+      const fx = FX[this.voiceKey] || FX.female;
+      this.rate = fx.rate;
+      const bus = this.bus = ctx.createGain();
+      const dry = ctx.createGain();
+      dry.gain.value = fx.ring ? 0.3 : 1;
+      bus.connect(dry);
+      dry.connect(this.outAn);
+      if (fx.ring) {
+        const ring = ctx.createGain();
+        ring.gain.value = 0;
+        const osc = this.osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = 55;
+        osc.connect(ring.gain);
+        osc.start();
+        const wet = ctx.createGain();
+        wet.gain.value = 1.15;
+        bus.connect(ring);
+        ring.connect(wet);
+        wet.connect(this.outAn);
+      }
 
       // Low-latency microphone capture.
       const blob = new Blob([WORKLET], {
@@ -228,19 +303,8 @@ export class Live {
         } catch {}
       };
 
-      // Request temporary Gemini authentication token.
-      const response = await fetch('/api/live-token', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${await this.h.jwt()}`
-        }
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Live token failed');
-      }
+      // Token was requested in parallel with mic setup (or prewarmed).
+      const result = await tokenP;
 
       const ai = new GoogleGenAI({
         apiKey: result.token,
@@ -355,11 +419,10 @@ export class Live {
 
     // Latency timer: last loud mic moment -> first AI audio
     if (!this.gotOutput && this.tLoud) {
-      console.log(
-        '[lat] you stopped → first AI audio:',
-        Math.round(performance.now() - this.tLoud),
-        'ms'
-      );
+      const ms = Math.round(performance.now() - this.tLoud);
+      console.log('[lat] you stopped → first AI audio:', ms, 'ms');
+      this.h.latency?.(ms);
+      this.tLoud = 0;
     }
 
     const bytes = decode(data);
@@ -387,7 +450,8 @@ export class Live {
     const source = this.ctx.createBufferSource();
 
     source.buffer = audio;
-    source.connect(this.outAn);
+    source.playbackRate.value = this.rate || 1;
+    source.connect(this.bus || this.outAn);
 
     // Schedule audio without unnecessary gaps.
     const startAt = Math.max(
@@ -397,7 +461,7 @@ export class Live {
 
     source.start(startAt);
 
-    this.nextAudioTime = startAt + audio.duration;
+    this.nextAudioTime = startAt + audio.duration / (this.rate || 1);
 
     this.sources.add(source);
     this.gotOutput = true;
@@ -547,6 +611,8 @@ export class Live {
     this.ctx = null;
     this.micAn = null;
     this.outAn = null;
+    this.bus = null;
+    this.osc = null;
 
     this.reset();
     this.h.state('idle');
