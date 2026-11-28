@@ -69,7 +69,10 @@ try{renderer=new THREE.WebGLRenderer({canvas:$('gl'),antialias:false,alpha:false
 catch(e){$('err').style.display='grid';}
 if(renderer){
 const coarse=matchMedia('(pointer:coarse)').matches;
-renderer.setPixelRatio(Math.min(devicePixelRatio||1,coarse?1.5:2));
+// Adaptive resolution: starts at the original ratio, only ever steps down if frames run slow.
+const PR_MAX=Math.min(devicePixelRatio||1,coarse?1.5:2);
+let pr=PR_MAX;
+renderer.setPixelRatio(pr);
 renderer.setClearColor(0x0c0d0f,1);
 const scene=new THREE.Scene();
 const cam=new THREE.PerspectiveCamera(35,1,.1,50);cam.position.z=6;
@@ -86,29 +89,119 @@ halo.position.z=-1.5;halo.renderOrder=0;scene.add(halo);
 let R0=1,Y0=0,visH=1;
 function resize(){const w=innerWidth,h=innerHeight;renderer.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix();visH=2*cam.position.z*Math.tan(cam.fov*Math.PI/360);R0=Math.min(.31*visH,.43*visH*cam.aspect);Y0=.025*visH;halo.scale.setScalar(R0*3.6*(1+1.5/6));}
 addEventListener('resize',resize);resize();
+
+// GPU context loss (common on mobile when switching apps): recover instead of freezing.
+$('gl').addEventListener('webglcontextlost',e=>e.preventDefault());
+$('gl').addEventListener('webglcontextrestored',()=>location.reload());
+
+/* ---------------- state & UI ---------------- */
 let mode='idle',muted=false,lvl={a:0,b:0},tg={think:0,glow:.05};
-const st=$('status'),cap=$('cap'),mic=$('mic'),authEl=$('auth'),am=$('am');
+const st=$('status'),cap=$('cap'),mic=$('mic'),muteBtn=$('mute'),authEl=$('auth'),am=$('am'),callState=$('callState');
 const LABEL={idle:'Tap to talk',connecting:'Connecting',listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
 const GLOW={idle:.05,connecting:.08,listening:.14,thinking:.2,speaking:.22};
-function setMode(m){mode=m;st.textContent=LABEL[m]||m;mic.classList.toggle('on',m!=='idle');tg.think=m==='thinking'?1:0;tg.glow=GLOW[m]??.05;}
+let errHold=0;
+
+function paintMute(){
+ muteBtn.classList.toggle('on',muted);
+ muteBtn.setAttribute('aria-pressed',muted);
+ const l=muted?'Unmute microphone':'Mute microphone';
+ muteBtn.setAttribute('aria-label',l);muteBtn.title=l;
+}
+
+function setMode(m){
+ mode=m;
+ // keep an error message visible for a moment instead of instantly overwriting it
+ if(!(m==='idle'&&performance.now()<errHold))st.textContent=LABEL[m]||m;
+ mic.classList.toggle('on',m!=='idle');
+ tg.think=m==='thinking'?1:0;
+ tg.glow=GLOW[m]??.05;
+ if(callState){callState.className=m==='idle'?'':'active';callState.textContent=m==='idle'?'':'● LIVE';}
+ if(m==='idle'&&muted){muted=false;live.setMuted(false);paintMute();} // a new call always starts unmuted
+}
+function showError(msg){
+ errHold=performance.now()+3500;st.textContent=msg;
+ setTimeout(()=>{if(mode==='idle')st.textContent=LABEL.idle;},3600);
+}
+
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
 let sb=null,convId=null;
 const jwt=async()=>(await sb.auth.getSession()).data.session?.access_token;
 async function save(role,content){try{if(!convId){const{data,error}=await sb.from('conversations').insert({}).select('id').single();if(error)throw error;convId=data.id;}const{error}=await sb.from('messages').insert({conversation_id:convId,role,content});if(error)throw error;}catch(e){console.warn('save failed',e);}}
-const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>{st.textContent=msg;}});
-const fail=e=>{setMode('idle');st.textContent=e?.name==='NotAllowedError'?'Microphone blocked':(e?.message||'Could not connect').slice(0,60);};
-mic.onclick=async()=>{if(!sb)return;if(!(await jwt())){authEl.classList.add('show');return;}if(mode==='idle'){cap.innerHTML='';convId=null;try{await live.start();}catch(e){fail(e);}}else live.interrupt();};
+
+const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>showError(msg)});
+
+const fail=e=>{setMode('idle');showError(e?.name==='NotAllowedError'?'Microphone blocked':(e?.message||'Could not connect').slice(0,60));};
+
+let starting=false;
+mic.onclick=async()=>{
+ if(!sb||starting)return;
+ if(!(await jwt())){authEl.classList.add('show');return;}
+ if(mode==='idle'){
+  starting=true;cap.innerHTML='';convId=null;
+  try{await live.start();}catch(e){fail(e);}finally{starting=false;}
+ }else if(mode!=='connecting')live.interrupt();
+};
 $('end').onclick=()=>{live.stop();cap.innerHTML='';};
-$('mute').onclick=e=>{muted=!muted;live.setMuted(muted);e.currentTarget.classList.toggle('on',muted);e.currentTarget.setAttribute('aria-label',muted?'Unmute':'Mute');};
+muteBtn.onclick=()=>{muted=!muted;live.setMuted(muted);paintMute();};
 $('tb').onclick=e=>{const on=e.currentTarget.getAttribute('aria-pressed')!=='true';e.currentTarget.setAttribute('aria-pressed',on);$('ui').classList.toggle('off',!on);};
 $('so').onclick=async()=>{live.stop();await sb.auth.signOut();};
-const doAuth=async up=>{am.textContent='';const email=$('em').value.trim(),password=$('pw').value;const{data,error}=up?await sb.auth.signUp({email,password}):await sb.auth.signInWithPassword({email,password});if(error)am.textContent=error.message;else if(up&&!data.session)am.textContent='Check your email to confirm, then sign in.';};
-$('af').onsubmit=e=>{e.preventDefault();doAuth(false);};$('su').onclick=()=>doAuth(true);
-(async()=>{try{const cfg=await(await fetch('/api/config')).json();if(!cfg.supabaseUrl)throw 0;sb=createClient(cfg.supabaseUrl,cfg.supabaseAnonKey);const on=s=>{$('so').hidden=!s;authEl.classList.toggle('show',!s);};sb.auth.onAuthStateChange((_e,s)=>on(!!s));on(!!(await sb.auth.getSession()).data.session);}catch{st.textContent='Backend not configured';}})();
+
+// Keyboard: M = mute, Esc = end call (ignored while typing in a field)
+addEventListener('keydown',e=>{
+ if(e.target.closest?.('input,textarea')||e.metaKey||e.ctrlKey||e.altKey)return;
+ if(e.key==='m'||e.key==='M')muteBtn.click();
+ else if(e.key==='Escape')$('end').click();
+});
+
+const doAuth=async up=>{
+ am.textContent='';
+ const email=$('em').value.trim(),password=$('pw').value;
+ const{data,error}=up?await sb.auth.signUp({email,password}):await sb.auth.signInWithPassword({email,password});
+ if(error)am.textContent=error.message;
+ else if(up&&!data.session)am.textContent='Check your email to confirm, then sign in.';
+};
+$('af').onsubmit=e=>{e.preventDefault();doAuth(false);};
+$('su').onclick=()=>doAuth(true);
+
+(async()=>{try{
+ const cfg=await(await fetch('/api/config')).json();
+ if(!cfg.supabaseUrl)throw 0;
+ sb=createClient(cfg.supabaseUrl,cfg.supabaseAnonKey);
+ const on=s=>{$('so').hidden=!s;authEl.classList.toggle('show',!s);};
+ sb.auth.onAuthStateChange((_e,s)=>{on(!!s);if(!s)live.stop();});
+ on(!!(await sb.auth.getSession()).data.session);
+}catch{st.textContent='Backend not configured';}})();
+
+/* ---------------- render loop (globe maths unchanged) ---------------- */
 let px=0,py=0,tx=0,ty=0;
 addEventListener('pointermove',e=>{tx=(e.clientX/innerWidth-.5)*2;ty=(e.clientY/innerHeight-.5)*2;});
 const reduce=matchMedia('(prefers-reduced-motion:reduce)').matches;
 const clock=new THREE.Clock();let T=0;
-function frame(){requestAnimationFrame(frame);if(document.hidden)return;const dt=Math.min(clock.getDelta(),.05);T+=dt;let tA=0,tB=0;if(mode==='listening'){const r=live.mic();tA=r.rms;tB=r.bass;}else if(mode==='speaking'){const r=live.out();tA=r.rms;tB=r.bass;}const k=tA>lvl.a?.4:.08;lvl.a+=(tA-lvl.a)*k;lvl.b+=(tB-lvl.b)*(tB>lvl.b?.45:.1);for(const m of [mBack,mFront]){const u=m.uniforms;u.uTime.value=T;u.uAmp.value=lvl.a;u.uBass.value=lvl.b;u.uThink.value+=(tg.think-u.uThink.value)*.04;u.uGlow.value+=(tg.glow-u.uGlow.value)*.05;}halo.material.uniforms.uI.value=.1+lvl.a*.35+tg.glow*.4+mFront.uniforms.uThink.value*.08;px+=(tx-px)*.04;py+=(ty-py)*.04;const f=reduce?.2:1;const think=mFront.uniforms.uThink.value;const s=R0*(1+lvl.a*.05);grp.scale.setScalar(s);grp.position.y=Y0+Math.sin(T*.6)*.035*R0*f-py*.02*R0;grp.position.x=px*.03*R0;grp.rotation.y=T*(.06+think*.25)*f+px*.25;grp.rotation.x=Math.sin(T*.25)*.1*f+py*.15;halo.position.x=grp.position.x;halo.position.y=grp.position.y;renderer.render(scene,cam);}
+let slow=0,seen=0;
+function frame(){
+ requestAnimationFrame(frame);
+ if(document.hidden){clock.getDelta();return;}
+ const raw=clock.getDelta(),dt=Math.min(raw,.05);T+=dt;
+
+ // adaptive resolution: ~1.5s of consistently slow frames -> drop pixel ratio one step (never below 1)
+ seen++;if(raw>.026)slow++;
+ if(seen>=90){if(slow>60&&pr>1){pr=Math.max(1,pr-.25);renderer.setPixelRatio(pr);resize();}slow=0;seen=0;}
+
+ let tA=0,tB=0;
+ if(mode==='listening'){const r=live.mic();tA=r.rms;tB=r.bass;}
+ else if(mode==='speaking'){const r=live.out();tA=r.rms;tB=r.bass;}
+ const k=tA>lvl.a?.4:.08;
+ lvl.a+=(tA-lvl.a)*k;lvl.b+=(tB-lvl.b)*(tB>lvl.b?.45:.1);
+ for(const m of [mBack,mFront]){const u=m.uniforms;u.uTime.value=T;u.uAmp.value=lvl.a;u.uBass.value=lvl.b;u.uThink.value+=(tg.think-u.uThink.value)*.04;u.uGlow.value+=(tg.glow-u.uGlow.value)*.05;}
+ halo.material.uniforms.uI.value=.1+lvl.a*.35+tg.glow*.4+mFront.uniforms.uThink.value*.08;
+ px+=(tx-px)*.04;py+=(ty-py)*.04;
+ const f=reduce?.2:1;const think=mFront.uniforms.uThink.value;
+ const s=R0*(1+lvl.a*.05);grp.scale.setScalar(s);
+ grp.position.y=Y0+Math.sin(T*.6)*.035*R0*f-py*.02*R0;grp.position.x=px*.03*R0;
+ grp.rotation.y=T*(.06+think*.25)*f+px*.25;grp.rotation.x=Math.sin(T*.25)*.1*f+py*.15;
+ halo.position.x=grp.position.x;halo.position.y=grp.position.y;
+ renderer.render(scene,cam);
+}
 frame();
 }
