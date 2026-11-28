@@ -18,6 +18,16 @@ const MODEL =
 const VOICE = process.env.GEMINI_VOICE || 'Aoede';
 const PORT = process.env.PORT || 8787;
 
+// Voice presets. Gemini has no boy/girl/robot voices, so each preset = a real
+// Gemini voice + a speaking-style hint (the client adds pitch/robot effects).
+const VOICES = {
+  male:   { voice: 'Charon', hint: 'Speak with a calm, deep, grounded male tone.' },
+  female: { voice: VOICE,    hint: 'Speak with a warm, natural female tone.' },
+  boy:    { voice: 'Puck',   hint: 'Speak like a cheerful, energetic young boy. Use simple, friendly words.' },
+  girl:   { voice: 'Leda',   hint: 'Speak like a bright, cheerful young girl. Use simple, friendly words.' },
+  robot:  { voice: 'Fenrir', hint: 'Speak like a precise, friendly robot: flat even pacing, little emotion, short crisp sentences.' }
+};
+
 const CACHE_TTL = 20000;
 const MAX_CACHE_ENTRIES = 500;
 
@@ -329,10 +339,15 @@ app.post('/api/live-token', auth, async (req, res) => {
       });
     }
 
-    const systemInstruction = await getUserContext(
+    const pick = VOICES[req.body?.voice] || VOICES.female;
+
+    const baseInstruction = await getUserContext(
       req.user.id,
       req.db
     );
+
+    const systemInstruction =
+      `${baseInstruction}\n\nVOICE STYLE: ${pick.hint}`;
 
     const config = {
       responseModalities: ['AUDIO'],
@@ -342,7 +357,7 @@ app.post('/api/live-token', auth, async (req, res) => {
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
-            voiceName: VOICE
+            voiceName: pick.voice
           }
         }
       },
