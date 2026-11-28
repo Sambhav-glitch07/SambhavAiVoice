@@ -136,7 +136,11 @@ let sb=null,convId=null;
 const jwt=async()=>(await sb.auth.getSession()).data.session?.access_token;
 async function save(role,content){try{if(!convId){const{data,error}=await sb.from('conversations').insert({}).select('id').single();if(error)throw error;convId=data.id;}const{error}=await sb.from('messages').insert({conversation_id:convId,role,content});if(error)throw error;}catch(e){console.warn('save failed',e);}}
 
-const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>showError(msg),latency:ms=>{lastMs=ms;paintCall();}});
+// Add ?debug to the page URL to see a live latency breakdown on screen
+const dbgEl=/[?&]debug\b/.test(location.search)?document.createElement('div'):null;
+if(dbgEl){dbgEl.style.cssText='position:fixed;left:10px;bottom:10px;z-index:9;font:11px/1.5 monospace;color:#bbb;background:rgba(0,0,0,.6);padding:6px 9px;border-radius:8px;pointer-events:none';document.body.appendChild(dbgEl);}
+const debug=(ms,i)=>{if(dbgEl)dbgEl.textContent=`total ${ms}ms | last word heard ${i.afterTranscript}ms ago | tools ${i.tool}ms`;};
+const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>showError(msg),latency:(ms,i)=>{lastMs=ms;paintCall();debug(ms,i);}});
 
 const fail=e=>{setMode('idle');showError(e?.name==='NotAllowedError'?'Microphone blocked':(e?.message||'Could not connect').slice(0,60));};
 
