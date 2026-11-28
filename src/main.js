@@ -99,13 +99,19 @@ let mode='idle',muted=false,lvl={a:0,b:0},tg={think:0,glow:.05};
 const st=$('status'),cap=$('cap'),mic=$('mic'),muteBtn=$('mute'),authEl=$('auth'),am=$('am'),callState=$('callState');
 const LABEL={idle:'Tap to talk',connecting:'Connecting',listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
 const GLOW={idle:.05,connecting:.08,listening:.14,thinking:.2,speaking:.22};
-let errHold=0;
+let errHold=0,lastMs=0;
 
 function paintMute(){
  muteBtn.classList.toggle('on',muted);
  muteBtn.setAttribute('aria-pressed',muted);
  const l=muted?'Unmute microphone':'Mute microphone';
  muteBtn.setAttribute('aria-label',l);muteBtn.title=l;
+}
+
+function paintCall(){
+ if(!callState)return;
+ callState.className=mode==='idle'?'':'active';
+ callState.textContent=mode==='idle'?'':'● LIVE'+(lastMs?' · '+lastMs+' ms':'');
 }
 
 function setMode(m){
@@ -115,7 +121,8 @@ function setMode(m){
  mic.classList.toggle('on',m!=='idle');
  tg.think=m==='thinking'?1:0;
  tg.glow=GLOW[m]??.05;
- if(callState){callState.className=m==='idle'?'':'active';callState.textContent=m==='idle'?'':'● LIVE';}
+ if(m==='idle')lastMs=0;
+ paintCall();
  if(m==='idle'&&muted){muted=false;live.setMuted(false);paintMute();} // a new call always starts unmuted
 }
 function showError(msg){
@@ -129,9 +136,35 @@ let sb=null,convId=null;
 const jwt=async()=>(await sb.auth.getSession()).data.session?.access_token;
 async function save(role,content){try{if(!convId){const{data,error}=await sb.from('conversations').insert({}).select('id').single();if(error)throw error;convId=data.id;}const{error}=await sb.from('messages').insert({conversation_id:convId,role,content});if(error)throw error;}catch(e){console.warn('save failed',e);}}
 
-const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>showError(msg)});
+const live=new Live({jwt,save,mode:()=>mode,state:setMode,transcript:(u,a)=>{cap.innerHTML=(u?'<b>'+esc(u)+'</b><br>':'')+esc(a);},error:msg=>showError(msg),latency:ms=>{lastMs=ms;paintCall();}});
 
 const fail=e=>{setMode('idle');showError(e?.name==='NotAllowedError'?'Microphone blocked':(e?.message||'Could not connect').slice(0,60));};
+
+// ---- voice picker ----
+const VOICE_LABEL={male:'Male',female:'Female',boy:'Boy',girl:'Girl',robot:'Robot'};
+const vb=$('vb'),vp=$('vp');
+let voiceKey;try{voiceKey=localStorage.getItem('sambhav.voice');}catch{}
+if(!VOICE_LABEL[voiceKey])voiceKey='female';
+live.setVoice(voiceKey);
+function paintVoice(){
+ vb.querySelector('span').textContent=VOICE_LABEL[voiceKey];
+ for(const o of vp.querySelectorAll('[data-v]'))o.setAttribute('aria-checked',o.dataset.v===voiceKey);
+}
+const closeVoice=()=>{vp.classList.remove('show');vb.setAttribute('aria-expanded','false');};
+vb.onclick=()=>{const open=vp.classList.toggle('show');vb.setAttribute('aria-expanded',open);};
+vp.onclick=e=>{
+ const o=e.target.closest('[data-v]');if(!o)return;
+ closeVoice();if(o.dataset.v===voiceKey)return;
+ voiceKey=o.dataset.v;try{localStorage.setItem('sambhav.voice',voiceKey);}catch{}
+ live.setVoice(voiceKey);paintVoice();
+ // Gemini fixes the voice when a session opens, so an active call restarts with the new voice
+ if(mode!=='idle'){live.stop();cap.innerHTML='';mic.click();}
+};
+document.addEventListener('pointerdown',e=>{if(!e.target.closest('#voiceWrap'))closeVoice();});
+paintVoice();
+
+// SPEED: get the Gemini token ready the moment a finger/cursor reaches the mic button
+for(const ev of ['pointerenter','pointerdown'])mic.addEventListener(ev,()=>{if(sb&&mode==='idle')live.prewarm();},{passive:true});
 
 let starting=false;
 mic.onclick=async()=>{
